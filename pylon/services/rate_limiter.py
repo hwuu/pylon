@@ -69,6 +69,7 @@ class RateLimiter:
         # SSE connection counters
         self._global_sse_connections = 0
         self._user_sse_connections: dict[str, int] = defaultdict(int)
+        self._api_sse_connections: dict[str, int] = defaultdict(int)
 
         # Request frequency counters (sliding window per minute)
         self._global_requests = Counter()
@@ -170,9 +171,21 @@ class RateLimiter:
                             message="API rate limit exceeded",
                         )
 
-                # Check API concurrency
-                if api_limit.max_concurrent is not None:
-                    if self._api_concurrent[api_identifier] >= api_limit.max_concurrent:
+                # Check API concurrency or SSE connections
+                if is_sse:
+                    if (
+                        api_limit.max_sse_connections is not None
+                        and self._api_sse_connections[api_identifier] >= api_limit.max_sse_connections
+                    ):
+                        return RateLimitStatus(
+                            result=RateLimitResult.API_LIMIT_EXCEEDED,
+                            message="API SSE connection limit exceeded",
+                        )
+                else:
+                    if (
+                        api_limit.max_concurrent is not None
+                        and self._api_concurrent[api_identifier] >= api_limit.max_concurrent
+                    ):
                         return RateLimitStatus(
                             result=RateLimitResult.API_LIMIT_EXCEEDED,
                             message="API concurrent limit exceeded",
@@ -240,6 +253,10 @@ class RateLimiter:
             if is_sse:
                 self._global_sse_connections += 1
                 self._user_sse_connections[user_id] += 1
+                # Increment API SSE counter
+                api_limit = self._get_api_limit(api_identifier)
+                if api_limit is not None and api_limit.max_sse_connections is not None:
+                    self._api_sse_connections[api_identifier] += 1
             else:
                 if not skip_global_concurrent:
                     self._global_concurrent += 1
@@ -247,7 +264,7 @@ class RateLimiter:
 
             # Increment API concurrent counter
             api_limit = self._get_api_limit(api_identifier)
-            if api_limit is not None and api_limit.max_concurrent is not None:
+            if api_limit is not None and api_limit.max_concurrent is not None and not is_sse:
                 self._api_concurrent[api_identifier] += 1
 
             # Increment request frequency counters
@@ -283,6 +300,13 @@ class RateLimiter:
                 self._user_sse_connections[user_id] = max(
                     0, self._user_sse_connections[user_id] - 1
                 )
+                # Decrement API SSE counter
+                if api_identifier:
+                    api_limit = self._get_api_limit(api_identifier)
+                    if api_limit is not None and api_limit.max_sse_connections is not None:
+                        self._api_sse_connections[api_identifier] = max(
+                            0, self._api_sse_connections[api_identifier] - 1
+                        )
             else:
                 self._global_concurrent = max(0, self._global_concurrent - 1)
                 self._user_concurrent[user_id] = max(
@@ -290,7 +314,7 @@ class RateLimiter:
                 )
 
             # Decrement API concurrent counter
-            if api_identifier:
+            if api_identifier and not is_sse:
                 api_limit = self._get_api_limit(api_identifier)
                 if api_limit is not None and api_limit.max_concurrent is not None:
                     self._api_concurrent[api_identifier] = max(

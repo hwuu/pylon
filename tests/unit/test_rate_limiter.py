@@ -23,6 +23,7 @@ def rate_limiter():
         ),
         apis={
             "POST /v1/heavy": RateLimitRule(max_requests_per_minute=5),
+            "POST /v1/stream": RateLimitRule(max_sse_connections=2),
         },
     )
     return RateLimiter(config)
@@ -130,6 +131,27 @@ class TestRateLimiter:
         status = await rate_limiter.check_rate_limit("user99", "GET /v1/stream", is_sse=True)
         assert status.allowed is False
         assert status.result == RateLimitResult.GLOBAL_LIMIT_EXCEEDED
+
+    @pytest.mark.asyncio
+    async def test_api_sse_connection_limit(self, rate_limiter):
+        """Test API-specific SSE connection limit."""
+        # POST /v1/stream has max_sse_connections=2
+        # Acquire 2 SSE connections from different users
+        await rate_limiter.acquire("user1", "POST /v1/stream", is_sse=True)
+        await rate_limiter.acquire("user2", "POST /v1/stream", is_sse=True)
+
+        # Third SSE connection should be blocked (API limit)
+        status = await rate_limiter.check_rate_limit("user3", "POST /v1/stream", is_sse=True)
+        assert status.allowed is False
+        assert status.result == RateLimitResult.API_LIMIT_EXCEEDED
+        assert "API SSE connection limit" in status.message
+
+        # Release one connection
+        await rate_limiter.release("user1", "POST /v1/stream", is_sse=True)
+
+        # Now should be allowed
+        status = await rate_limiter.check_rate_limit("user3", "POST /v1/stream", is_sse=True)
+        assert status.allowed is True
 
     @pytest.mark.asyncio
     async def test_increment_request_count(self, rate_limiter):

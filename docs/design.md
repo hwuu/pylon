@@ -276,7 +276,7 @@ Response:
 |------|---------|------|
 | 并发数 | 全局 / 用户 / API | 同时处理的请求数（含 SSE 消息） |
 | 请求频率 | 全局 / 用户 / API | 普通请求 + SSE 消息数，每分钟 |
-| SSE 并发连接数 | 全局 / 用户 | 同时保持的 SSE 连接数 |
+| SSE 并发连接数 | 全局 / 用户 / API | 同时保持的 SSE 连接数 |
 
 **SSE 消息处理**：
 - 每条 SSE 消息等同于一次普通 HTTP 请求
@@ -430,6 +430,7 @@ rate_limit:
     "POST /v1/chat/completions":
       max_concurrent: 30            # 该 API 最多同时 30 个请求
       max_requests_per_minute: 100  # 该 API 全局最多 100/分钟
+      max_sse_connections: 10       # 该 API 最多同时 10 个 SSE 连接
     "POST /v1/images/generate":
       max_concurrent: 5             # 生成类 API 并发限制更严格
       max_requests_per_minute: 20
@@ -638,6 +639,7 @@ rate_limit:
     "POST /v1/chat/completions":
       max_concurrent: 30
       max_requests_per_minute: 100
+      max_sse_connections: 10
     "POST /v1/images/generate":
       max_concurrent: 5
       max_requests_per_minute: 20
