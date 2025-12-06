@@ -283,3 +283,82 @@ class TestCheckOrderPerDesign:
         # Third user should trigger queue (not user/API limit)
         status = await limiter.check_rate_limit("user3", "POST /api/other")
         assert status.result == RateLimitResult.QUEUE_REQUIRED
+
+
+class TestApiConcurrentLimit:
+    """Tests for API-level concurrent limit."""
+
+    @pytest.mark.asyncio
+    async def test_api_concurrent_limit(self):
+        """Test API concurrent limit is enforced."""
+        config = RateLimitConfig(
+            global_limit=RateLimitRule(max_concurrent=100, max_requests_per_minute=1000),
+            default_user=RateLimitRule(max_concurrent=100, max_requests_per_minute=1000),
+            apis={
+                "POST /api/slow": RateLimitRule(max_concurrent=2, max_requests_per_minute=100)
+            },
+        )
+        limiter = RateLimiter(config)
+
+        # Fill API concurrent limit
+        await limiter.acquire("user1", "POST /api/slow")
+        await limiter.acquire("user2", "POST /api/slow")
+
+        # Third request to same API should be rejected
+        status = await limiter.check_rate_limit("user3", "POST /api/slow")
+        assert status.result == RateLimitResult.API_LIMIT_EXCEEDED
+        assert "concurrent" in status.message.lower()
+
+        # Different API should still work
+        status = await limiter.check_rate_limit("user3", "POST /api/fast")
+        assert status.allowed
+
+    @pytest.mark.asyncio
+    async def test_api_concurrent_released_properly(self):
+        """Test API concurrent counter is decremented on release."""
+        config = RateLimitConfig(
+            global_limit=RateLimitRule(max_concurrent=100, max_requests_per_minute=1000),
+            default_user=RateLimitRule(max_concurrent=100, max_requests_per_minute=1000),
+            apis={
+                "POST /api/slow": RateLimitRule(max_concurrent=1, max_requests_per_minute=100)
+            },
+        )
+        limiter = RateLimiter(config)
+
+        # Acquire
+        await limiter.acquire("user1", "POST /api/slow")
+
+        # Should be rejected
+        status = await limiter.check_rate_limit("user2", "POST /api/slow")
+        assert status.result == RateLimitResult.API_LIMIT_EXCEEDED
+
+        # Release with api_identifier
+        await limiter.release("user1", "POST /api/slow")
+
+        # Now should be allowed
+        status = await limiter.check_rate_limit("user2", "POST /api/slow")
+        assert status.allowed
+
+    @pytest.mark.asyncio
+    async def test_api_concurrent_independent_of_global(self):
+        """Test API concurrent is independent of global concurrent."""
+        config = RateLimitConfig(
+            global_limit=RateLimitRule(max_concurrent=10, max_requests_per_minute=1000),
+            default_user=RateLimitRule(max_concurrent=10, max_requests_per_minute=1000),
+            apis={
+                "POST /api/limited": RateLimitRule(max_concurrent=1, max_requests_per_minute=100)
+            },
+        )
+        limiter = RateLimiter(config)
+
+        # Acquire to different APIs
+        await limiter.acquire("user1", "POST /api/other1")
+        await limiter.acquire("user2", "POST /api/other2")
+        await limiter.acquire("user3", "POST /api/limited")
+
+        # Limited API should be full, others still ok
+        status = await limiter.check_rate_limit("user4", "POST /api/limited")
+        assert status.result == RateLimitResult.API_LIMIT_EXCEEDED
+
+        status = await limiter.check_rate_limit("user4", "POST /api/other3")
+        assert status.allowed

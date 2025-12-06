@@ -284,7 +284,7 @@ async def proxy_request(
 
             finally:
                 # Release rate limit slot
-                await _rate_limiter.release(api_key.id)
+                await _rate_limiter.release(api_key.id, api_identifier)
 
 
 async def _handle_sse_request(
@@ -299,8 +299,7 @@ async def _handle_sse_request(
     """Handle SSE streaming request."""
 
     async def generate():
-        """Generate SSE stream with idle timeout and message counting."""
-        message_count = 0
+        """Generate SSE stream with idle timeout and message rate limiting."""
         last_data_time = time.time()
 
         try:
@@ -341,13 +340,26 @@ async def _handle_sse_request(
                 # Count SSE data events (lines starting with "data:")
                 if chunk:
                     chunk_str = chunk.decode("utf-8", errors="replace")
-                    message_count += chunk_str.count("data:")
+                    data_count = chunk_str.count("data:")
 
-                    # Periodically increment request count for rate limiting
-                    if message_count > 0 and message_count % 10 == 0:
-                        await _rate_limiter.increment_request_count(
-                            api_key.id, api_identifier, count=10
+                    # Rate limit each SSE message
+                    for _ in range(data_count):
+                        # Check and increment frequency counter
+                        status = await _rate_limiter.increment_and_check_frequency(
+                            api_key.id, api_identifier
                         )
+                        if not status.allowed:
+                            # Wait for frequency window to reset
+                            wait_result = await _rate_limiter.wait_for_frequency_slot(
+                                api_key.id, api_identifier, timeout=60.0
+                            )
+                            if wait_result is None:
+                                # Timeout waiting for frequency slot
+                                yield _create_pylon_error_event(
+                                    "rate_limit_timeout",
+                                    "Timeout waiting for rate limit window reset"
+                                ).encode("utf-8")
+                                return
 
                 yield chunk
 
@@ -358,13 +370,6 @@ async def _handle_sse_request(
                         f"No data received for {_sse_idle_timeout} seconds"
                     ).encode("utf-8")
                     return
-
-            # Increment remaining message count
-            remaining = message_count % 10
-            if remaining > 0:
-                await _rate_limiter.increment_request_count(
-                    api_key.id, api_identifier, count=remaining
-                )
 
         except asyncio.TimeoutError:
             yield _create_pylon_error_event(
@@ -381,7 +386,7 @@ async def _handle_sse_request(
 
         finally:
             # Release SSE connection slot
-            await _rate_limiter.release(api_key.id, is_sse=True)
+            await _rate_limiter.release(api_key.id, api_identifier, is_sse=True)
 
     return StreamingResponse(
         generate(),

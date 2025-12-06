@@ -274,9 +274,15 @@ Response:
 
 | 维度 | 适用范围 | 说明 |
 |------|---------|------|
-| 普通 HTTP 并发数 | 全局 / 用户 | 同时处理的普通请求数 |
+| 并发数 | 全局 / 用户 / API | 同时处理的请求数（含 SSE 消息） |
 | 请求频率 | 全局 / 用户 / API | 普通请求 + SSE 消息数，每分钟 |
 | SSE 并发连接数 | 全局 / 用户 | 同时保持的 SSE 连接数 |
+
+**SSE 消息处理**：
+- 每条 SSE 消息等同于一次普通 HTTP 请求
+- 共享并发池和频率配额
+- 并发满时入队等待
+- 频率超限时等待到窗口重置（不断开连接）
 
 ### 4.2 限流检查顺序
 
@@ -401,6 +407,7 @@ data: {"code": "rate_limit_exceeded", "message": "Request limit exceeded"}
 | code | 说明 |
 |------|------|
 | `rate_limit_exceeded` | 请求频率超限 |
+| `rate_limit_timeout` | 等待频率窗口重置超时 |
 | `idle_timeout` | 空闲超时断开 |
 | `downstream_error` | downstream 连接异常 |
 | `stream_error` | SSE 流处理异常 |
@@ -410,7 +417,7 @@ data: {"code": "rate_limit_exceeded", "message": "Request limit exceeded"}
 ```yaml
 rate_limit:
   global:
-    max_concurrent: 50              # 普通 HTTP 并发上限
+    max_concurrent: 50              # 并发上限（含 SSE 消息）
     max_requests_per_minute: 500    # 普通请求 + SSE 消息，每分钟
     max_sse_connections: 20         # SSE 并发连接上限
 
@@ -421,9 +428,11 @@ rate_limit:
 
   apis:                             # 按 API 限流（可选）
     "POST /v1/chat/completions":
+      max_concurrent: 30            # 该 API 最多同时 30 个请求
       max_requests_per_minute: 100  # 该 API 全局最多 100/分钟
     "POST /v1/images/generate":
-      max_requests_per_minute: 20   # 生成类 API 限制更严格
+      max_concurrent: 5             # 生成类 API 并发限制更严格
+      max_requests_per_minute: 20
 
 queue:
   max_size: 100                     # 队列上限
@@ -627,8 +636,10 @@ rate_limit:
 
   apis:
     "POST /v1/chat/completions":
+      max_concurrent: 30
       max_requests_per_minute: 100
     "POST /v1/images/generate":
+      max_concurrent: 5
       max_requests_per_minute: 20
 
 queue:

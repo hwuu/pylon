@@ -64,6 +64,7 @@ class RateLimiter:
         # Concurrent request counters
         self._global_concurrent = 0
         self._user_concurrent: dict[str, int] = defaultdict(int)
+        self._api_concurrent: dict[str, int] = defaultdict(int)
 
         # SSE connection counters
         self._global_sse_connections = 0
@@ -158,14 +159,24 @@ class RateLimiter:
 
             # === Step 2: Check API Limits ===
 
-            if api_limit is not None and api_limit.max_requests_per_minute is not None:
-                api_counter = self._api_requests[api_identifier]
-                self._reset_counter_if_needed(api_counter)
-                if api_counter.count >= api_limit.max_requests_per_minute:
-                    return RateLimitStatus(
-                        result=RateLimitResult.API_LIMIT_EXCEEDED,
-                        message="API rate limit exceeded",
-                    )
+            if api_limit is not None:
+                # Check API frequency
+                if api_limit.max_requests_per_minute is not None:
+                    api_counter = self._api_requests[api_identifier]
+                    self._reset_counter_if_needed(api_counter)
+                    if api_counter.count >= api_limit.max_requests_per_minute:
+                        return RateLimitStatus(
+                            result=RateLimitResult.API_LIMIT_EXCEEDED,
+                            message="API rate limit exceeded",
+                        )
+
+                # Check API concurrency
+                if api_limit.max_concurrent is not None:
+                    if self._api_concurrent[api_identifier] >= api_limit.max_concurrent:
+                        return RateLimitStatus(
+                            result=RateLimitResult.API_LIMIT_EXCEEDED,
+                            message="API concurrent limit exceeded",
+                        )
 
             # === Step 3: Check Global Limits ===
 
@@ -234,6 +245,11 @@ class RateLimiter:
                     self._global_concurrent += 1
                 self._user_concurrent[user_id] += 1
 
+            # Increment API concurrent counter
+            api_limit = self._get_api_limit(api_identifier)
+            if api_limit is not None and api_limit.max_concurrent is not None:
+                self._api_concurrent[api_identifier] += 1
+
             # Increment request frequency counters
             self._reset_counter_if_needed(self._global_requests)
             self._global_requests.count += 1
@@ -242,7 +258,6 @@ class RateLimiter:
             self._reset_counter_if_needed(user_counter)
             user_counter.count += 1
 
-            api_limit = self._get_api_limit(api_identifier)
             if api_limit is not None:
                 api_counter = self._api_requests[api_identifier]
                 self._reset_counter_if_needed(api_counter)
@@ -251,12 +266,16 @@ class RateLimiter:
     async def release(
         self,
         user_id: str,
+        api_identifier: str = "",
         is_sse: bool = False,
     ) -> None:
         """
         Release rate limit slots (decrement concurrent counters).
 
-        Should be called when request completes.
+        Args:
+            user_id: The API key ID
+            api_identifier: The API identifier (for API concurrent tracking)
+            is_sse: Whether this is an SSE connection
         """
         async with self._lock:
             if is_sse:
@@ -269,6 +288,14 @@ class RateLimiter:
                 self._user_concurrent[user_id] = max(
                     0, self._user_concurrent[user_id] - 1
                 )
+
+            # Decrement API concurrent counter
+            if api_identifier:
+                api_limit = self._get_api_limit(api_identifier)
+                if api_limit is not None and api_limit.max_concurrent is not None:
+                    self._api_concurrent[api_identifier] = max(
+                        0, self._api_concurrent[api_identifier] - 1
+                    )
 
         # Notify queue that a slot may be available
         if self._queue is not None and not is_sse:
@@ -386,6 +413,105 @@ class RateLimiter:
                         result=RateLimitResult.GLOBAL_LIMIT_EXCEEDED,
                         message="System request rate limit exceeded",
                     )
+
+            return RateLimitStatus(result=RateLimitResult.ALLOWED)
+
+    async def wait_for_frequency_slot(
+        self,
+        user_id: str,
+        api_identifier: str,
+        timeout: float = 60.0,
+    ) -> Optional[float]:
+        """
+        Wait for frequency limit to allow more requests.
+
+        Polls until frequency limit resets or timeout is reached.
+
+        Args:
+            user_id: The API key ID
+            api_identifier: The API identifier
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            Seconds waited if slot acquired, None if timeout.
+        """
+        import time
+
+        start_time = time.time()
+        poll_interval = 0.1  # 100ms polling interval
+
+        while True:
+            status = await self.check_request_frequency(user_id, api_identifier)
+            if status.allowed:
+                return time.time() - start_time
+
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                return None
+
+            # Wait before next poll
+            await asyncio.sleep(min(poll_interval, timeout - elapsed))
+
+    async def increment_and_check_frequency(
+        self,
+        user_id: str,
+        api_identifier: str,
+    ) -> RateLimitStatus:
+        """
+        Check frequency limit and increment counters atomically.
+
+        This is for SSE messages: check first, only increment if allowed.
+
+        Args:
+            user_id: The API key ID
+            api_identifier: The API identifier
+
+        Returns:
+            RateLimitStatus indicating if the increment was allowed.
+        """
+        async with self._lock:
+            user_limit = self._get_user_limit(user_id)
+            api_limit = self._get_api_limit(api_identifier)
+            global_limit = self.config.global_limit
+
+            # Check user request frequency
+            if user_limit.max_requests_per_minute is not None:
+                user_counter = self._user_requests[user_id]
+                self._reset_counter_if_needed(user_counter)
+                if user_counter.count >= user_limit.max_requests_per_minute:
+                    return RateLimitStatus(
+                        result=RateLimitResult.USER_LIMIT_EXCEEDED,
+                        message="Your request rate limit exceeded",
+                    )
+
+            # Check API limits
+            if api_limit is not None and api_limit.max_requests_per_minute is not None:
+                api_counter = self._api_requests[api_identifier]
+                self._reset_counter_if_needed(api_counter)
+                if api_counter.count >= api_limit.max_requests_per_minute:
+                    return RateLimitStatus(
+                        result=RateLimitResult.API_LIMIT_EXCEEDED,
+                        message="API rate limit exceeded",
+                    )
+
+            # Check global request frequency
+            if global_limit.max_requests_per_minute is not None:
+                self._reset_counter_if_needed(self._global_requests)
+                if self._global_requests.count >= global_limit.max_requests_per_minute:
+                    return RateLimitStatus(
+                        result=RateLimitResult.GLOBAL_LIMIT_EXCEEDED,
+                        message="System request rate limit exceeded",
+                    )
+
+            # All checks passed, increment counters
+            self._global_requests.count += 1
+
+            user_counter = self._user_requests[user_id]
+            user_counter.count += 1
+
+            if api_limit is not None:
+                api_counter = self._api_requests[api_identifier]
+                api_counter.count += 1
 
             return RateLimitStatus(result=RateLimitResult.ALLOWED)
 
