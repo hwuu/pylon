@@ -105,7 +105,7 @@ async def run_servers(config: Config):
         await conn.run_sync(Base.metadata.create_all)
 
     session_factory = create_async_session_factory(engine)
-    rate_limiter = RateLimiter(config.rate_limit)
+    rate_limiter = RateLimiter(config.rate_limit, config.queue)
 
     # Create apps with shared resources
     proxy_app = create_proxy_app(config, engine, session_factory, rate_limiter)

@@ -129,57 +129,102 @@ Response:
 
 ### 2.4 请求处理流程
 
+#### 2.4.1 认证与限流检查
+
 ```
-                             Request
-                                |
-                                v
-                   +------------------------+
-                   |  Parse API Key         |
-                   |  (Authorization Header)|
-                   +------------------------+
-                                |
-                                v
-                   +------------------------+
-                   |  Validate API Key      |
-                   |  - Exists?             |
-                   |  - Not expired?        |
-                   |  - Not revoked?        |
-                   +------------------------+
-                                |
-                         +------+------+
-                         |             |
-                      Invalid        Valid
-                         |             |
-                         v             v
-                    401 Error   +------------------------+
-                                |  Check User Rate Limit |
-                                +------------------------+
-                                           |
-                                    +------+------+
-                                    |             |
-                                 Exceeded       OK
-                                    |             |
-                                    v             v
-                               429 Error  +------------------------+
-                               "User      |  Check Global Rate     |
-                                limit"    |  Limit                 |
-                                          +------------------------+
-                                                     |
-                                              +------+------+
-                                              |             |
-                                           Exceeded       OK
-                                              |             |
-                                              v             v
-                                         429 Error   +------------------------+
-                                         "System     |  Forward to            |
-                                          busy"      |  Downstream API        |
-                                                     +------------------------+
-                                                                |
-                                                                v
-                                                     +------------------------+
-                                                     |  Log Request           |
-                                                     |  Return Response       |
-                                                     +------------------------+
+                         Request
+                            |
+                            v
+               +------------------------+
+               |  Parse API Key         |
+               |  (Authorization Header)|
+               +------------------------+
+                            |
+                            v
+               +------------------------+
+               |  Validate API Key      |
+               |  - Exists?             |
+               |  - Not expired?        |
+               |  - Not revoked?        |
+               +------------------------+
+                            |
+                     +------+------+
+                     |             |
+                  Invalid        Valid
+                     |             |
+                     v             v
+                401 Error   +------------------------+
+                            |  Check User Limit      |
+                            |  - Frequency           |
+                            |  - Concurrency         |
+                            +------------------------+
+                                       |
+                                +------+------+
+                                |             |
+                             Exceeded       OK
+                                |             |
+                                v             v
+                           429 Error   +------------------------+
+                           "User       |  Check API Limit       |
+                            limit"     |  - Frequency           |
+                                       +------------------------+
+                                                  |
+                                           +------+------+
+                                           |             |
+                                        Exceeded       OK
+                                           |             |
+                                           v             v
+                                      429 Error   +------------------------+
+                                      "API        |  Check Global Limit    |
+                                       limit"     |  - Frequency           |
+                                                  |  - Concurrency         |
+                                                  +------------------------+
+                                                             |
+                                                  +----------+----------+
+                                                  |          |          |
+                                             Frequency  Concurrency    OK
+                                             Exceeded     Full          |
+                                                  |          |          |
+                                                  v          v          v
+                                             429 Error   [Queue]   [Forward]
+                                             "System
+                                              busy"
+```
+
+#### 2.4.2 队列处理
+
+```
+                      [Queue]
+                         |
+                         v
+               +------------------+
+               | Enter Priority   |
+               | Queue & Wait     |
+               +------------------+
+                         |
+             +-----------+-----------+
+             |           |           |
+          Timeout    Preempted   Acquired
+             |           |           |
+             v           v           v
+        504 Error   503 Error   [Forward]
+        "Queue      "Request
+         timeout"    preempted"
+
+
+                     [Forward]
+                         |
+                         v
+               +------------------+
+               | Forward to       |
+               | Downstream API   |
+               +------------------+
+                         |
+                         v
+               +------------------+
+               | Return Response  |
+               | Release Slot     |
+               +------------------+
 ```
 
 ---

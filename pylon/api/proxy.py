@@ -16,6 +16,7 @@ from pylon.models.api_key import ApiKey
 from pylon.services.auth import AuthService, extract_api_key_from_header
 from pylon.services.proxy import ProxyService, get_api_identifier
 from pylon.services.rate_limiter import RateLimiter, RateLimitResult
+from pylon.services.queue import QueueResult
 
 
 logger = logging.getLogger(__name__)
@@ -101,10 +102,15 @@ async def check_rate_limits(
     api_key: ApiKey,
     api_identifier: str,
     is_sse: bool = False,
-) -> None:
-    """Check rate limits and raise exception if exceeded."""
+) -> bool:
+    """
+    Check rate limits and raise exception if exceeded.
+
+    Returns:
+        True if should wait in queue, False if can proceed immediately.
+    """
     if not _rate_limiter:
-        return
+        return False
 
     status = await _rate_limiter.check_rate_limit(
         user_id=api_key.id,
@@ -112,18 +118,54 @@ async def check_rate_limits(
         is_sse=is_sse,
     )
 
-    if not status.allowed:
-        error_messages = {
-            RateLimitResult.USER_LIMIT_EXCEEDED: "Your request limit exceeded",
-            RateLimitResult.API_LIMIT_EXCEEDED: "API rate limit exceeded",
-            RateLimitResult.GLOBAL_LIMIT_EXCEEDED: "System busy, please try again later",
-        }
+    if status.allowed:
+        return False
+
+    if status.should_queue:
+        return True
+
+    # Rate limit exceeded - raise error
+    error_messages = {
+        RateLimitResult.USER_LIMIT_EXCEEDED: "Your request limit exceeded",
+        RateLimitResult.API_LIMIT_EXCEEDED: "API rate limit exceeded",
+        RateLimitResult.GLOBAL_LIMIT_EXCEEDED: "System busy, please try again later",
+    }
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "error": "rate_limit_exceeded",
+            "message": error_messages.get(status.result, status.message),
+        },
+    )
+
+
+async def wait_in_queue(api_key: ApiKey) -> None:
+    """
+    Wait in the priority queue for a slot.
+
+    Raises HTTPException if timeout or preempted.
+    """
+    if not _rate_limiter:
         raise HTTPException(
-            status_code=429,
-            detail={
-                "error": "rate_limit_exceeded",
-                "message": error_messages.get(status.result, status.message),
-            },
+            status_code=503,
+            detail={"error": "service_unavailable", "message": "Queue not configured"},
+        )
+
+    result = await _rate_limiter.wait_in_queue(api_key.id, api_key.priority)
+
+    if result == QueueResult.ACQUIRED:
+        return
+
+    if result == QueueResult.TIMEOUT:
+        raise HTTPException(
+            status_code=504,
+            detail={"error": "gateway_timeout", "message": "Queue wait timeout"},
+        )
+
+    if result == QueueResult.PREEMPTED:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "preempted", "message": "Request preempted by higher priority"},
         )
 
 
@@ -162,6 +204,7 @@ async def proxy_request(
 
     This is the main proxy endpoint that handles all HTTP methods.
     Supports both regular HTTP requests and SSE (Server-Sent Events) streams.
+    Implements priority queue for waiting when concurrency is full.
     """
     if not _proxy_service or not _session_factory:
         raise HTTPException(
@@ -184,11 +227,19 @@ async def proxy_request(
             full_path = f"{full_path}?{request.url.query}"
         api_identifier = get_api_identifier(request.method, full_path)
 
-        # Check rate limits
-        await check_rate_limits(api_key, api_identifier, is_sse=is_sse)
+        # Check rate limits - may need to queue
+        should_queue = await check_rate_limits(api_key, api_identifier, is_sse=is_sse)
 
-        # Acquire rate limit slot
-        await _rate_limiter.acquire(api_key.id, api_identifier, is_sse=is_sse)
+        if should_queue:
+            # Wait in priority queue for a slot
+            await wait_in_queue(api_key)
+            # Queue already acquired global concurrent slot, just update user counters
+            await _rate_limiter.acquire(
+                api_key.id, api_identifier, is_sse=is_sse, skip_global_concurrent=True
+            )
+        else:
+            # Acquire rate limit slot directly
+            await _rate_limiter.acquire(api_key.id, api_identifier, is_sse=is_sse)
 
         # Get headers as dict
         headers = dict(request.headers)
