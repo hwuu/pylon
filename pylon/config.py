@@ -49,6 +49,13 @@ class RateLimitRule:
 
 
 @dataclass
+class ApiPattern:
+    """API pattern with rate limit rule."""
+    pattern: str  # e.g., "GET /users/{id}" or "POST /v1/chat/*"
+    rule: RateLimitRule
+
+
+@dataclass
 class RateLimitConfig:
     global_limit: RateLimitRule = field(default_factory=lambda: RateLimitRule(
         max_concurrent=50,
@@ -61,6 +68,7 @@ class RateLimitConfig:
         max_sse_connections=2
     ))
     apis: dict[str, RateLimitRule] = field(default_factory=dict)
+    api_patterns: list[ApiPattern] = field(default_factory=list)
 
 
 @dataclass
@@ -175,10 +183,19 @@ def load_config(config_path: str | Path) -> Config:
             for api_path, api_limit in rl_data["apis"].items():
                 apis[api_path] = _parse_rate_limit_rule(api_limit)
 
+        api_patterns = []
+        if "api_patterns" in rl_data and rl_data["api_patterns"]:
+            for pattern_data in rl_data["api_patterns"]:
+                pattern = pattern_data.get("pattern", "")
+                if pattern:
+                    rule = _parse_rate_limit_rule(pattern_data)
+                    api_patterns.append(ApiPattern(pattern=pattern, rule=rule))
+
         config.rate_limit = RateLimitConfig(
             global_limit=global_limit,
             default_user=default_user,
             apis=apis,
+            api_patterns=api_patterns,
         )
 
     # Queue

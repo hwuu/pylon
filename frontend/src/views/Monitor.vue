@@ -7,7 +7,8 @@ const monitorData = ref({
   global_concurrent: 0,
   global_sse_connections: 0,
   global_requests_this_minute: 0,
-  queue_size: 0
+  queue_size: 0,
+  user_stats: []
 })
 
 const loading = ref(false)
@@ -169,6 +170,50 @@ onUnmounted(() => {
       </el-row>
     </el-card>
 
+    <!-- Per-User Statistics -->
+    <el-card class="user-stats-card">
+      <template #header>
+        <span>Active Users</span>
+      </template>
+
+      <el-table
+        :data="monitorData.user_stats"
+        stripe
+        :empty-text="'No active users'"
+        max-height="300"
+      >
+        <el-table-column prop="user_id" label="API Key ID" width="320">
+          <template #default="{ row }">
+            <code>{{ row.user_id }}</code>
+          </template>
+        </el-table-column>
+        <el-table-column prop="concurrent" label="Concurrent" width="120" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.concurrent > 0" type="primary" size="small">
+              {{ row.concurrent }}
+            </el-tag>
+            <span v-else class="zero-value">0</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="sse_connections" label="SSE" width="120" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.sse_connections > 0" type="warning" size="small">
+              {{ row.sse_connections }}
+            </el-tag>
+            <span v-else class="zero-value">0</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="requests_this_minute" label="Requests/min" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.requests_this_minute > 0" type="success" size="small">
+              {{ row.requests_this_minute }}
+            </el-tag>
+            <span v-else class="zero-value">0</span>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
     <!-- Info Card -->
     <el-card>
       <template #header>
@@ -285,5 +330,18 @@ export default {
   margin-bottom: 10px;
   font-weight: 500;
   color: #606266;
+}
+
+.user-stats-card {
+  margin-bottom: 20px;
+}
+
+.user-stats-card code {
+  font-size: 12px;
+  color: #606266;
+}
+
+.zero-value {
+  color: #c0c4cc;
 }
 </style>

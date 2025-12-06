@@ -3,15 +3,20 @@ Rate limiter service for controlling request rates.
 """
 
 import asyncio
+import json
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Optional, Callable, Awaitable
 
-from pylon.config import RateLimitConfig, RateLimitRule, QueueConfig
+from pylon.config import RateLimitConfig, RateLimitRule, QueueConfig, ApiPattern
 from pylon.services.queue import RequestQueue, QueueResult
 from pylon.models.api_key import Priority
+
+
+logger = logging.getLogger(__name__)
 
 
 class RateLimitResult(Enum):
@@ -55,11 +60,23 @@ class RateLimiter:
     - Request frequency limiting (per minute)
     - SSE connection limiting
     - Priority queue for waiting requests
+    - Per-user rate limit config from database
     """
 
-    def __init__(self, config: RateLimitConfig, queue_config: Optional[QueueConfig] = None):
+    def __init__(
+        self,
+        config: RateLimitConfig,
+        queue_config: Optional[QueueConfig] = None,
+        user_config_loader: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
+    ):
         self.config = config
         self._lock = asyncio.Lock()
+
+        # Callback to load user config from database (returns JSON string or None)
+        self._user_config_loader = user_config_loader
+
+        # Cache for user rate limit configs (user_id -> RateLimitRule)
+        self._user_config_cache: dict[str, RateLimitRule] = {}
 
         # Concurrent request counters
         self._global_concurrent = 0
@@ -81,14 +98,123 @@ class RateLimiter:
         if queue_config:
             self._queue = RequestQueue(queue_config, self._try_acquire_slot)
 
-    def _get_user_limit(self, user_id: str) -> RateLimitRule:
-        """Get rate limit rule for a user (from config or default)."""
-        # TODO: Support per-user config from database
+    def set_user_config_loader(
+        self, loader: Callable[[str], Awaitable[Optional[str]]]
+    ) -> None:
+        """Set the callback to load user config from database."""
+        self._user_config_loader = loader
+
+    async def _load_user_config(self, user_id: str) -> Optional[RateLimitRule]:
+        """Load user rate limit config from database."""
+        if self._user_config_loader is None:
+            return None
+
+        try:
+            config_json = await self._user_config_loader(user_id)
+            if config_json is None:
+                return None
+
+            config_dict = json.loads(config_json)
+            return RateLimitRule(
+                max_concurrent=config_dict.get("max_concurrent"),
+                max_requests_per_minute=config_dict.get("max_requests_per_minute"),
+                max_sse_connections=config_dict.get("max_sse_connections"),
+            )
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning(f"Failed to parse user rate limit config for {user_id}: {e}")
+            return None
+
+    async def _get_user_limit(self, user_id: str) -> RateLimitRule:
+        """Get rate limit rule for a user (from cache, database, or default)."""
+        # Check cache first
+        if user_id in self._user_config_cache:
+            return self._user_config_cache[user_id]
+
+        # Try to load from database
+        user_config = await self._load_user_config(user_id)
+        if user_config is not None:
+            # Merge with default config (user config overrides default)
+            merged = RateLimitRule(
+                max_concurrent=user_config.max_concurrent
+                if user_config.max_concurrent is not None
+                else self.config.default_user.max_concurrent,
+                max_requests_per_minute=user_config.max_requests_per_minute
+                if user_config.max_requests_per_minute is not None
+                else self.config.default_user.max_requests_per_minute,
+                max_sse_connections=user_config.max_sse_connections
+                if user_config.max_sse_connections is not None
+                else self.config.default_user.max_sse_connections,
+            )
+            self._user_config_cache[user_id] = merged
+            return merged
+
+        # Use default
         return self.config.default_user
 
+    def invalidate_user_config_cache(self, user_id: str) -> None:
+        """Invalidate cached user config (call when user config is updated)."""
+        self._user_config_cache.pop(user_id, None)
+
+    def _match_api_pattern(self, pattern: str, api_identifier: str) -> bool:
+        """
+        Match an API identifier against a pattern.
+
+        Supports:
+        - Exact match: "GET /users" matches "GET /users"
+        - Parameter match: "GET /users/{id}" matches "GET /users/123"
+        - Wildcard match: "POST /v1/*" matches "POST /v1/chat/completions"
+
+        Args:
+            pattern: The pattern to match against (e.g., "GET /users/{id}")
+            api_identifier: The API identifier (e.g., "GET /users/123")
+
+        Returns:
+            True if the pattern matches the api_identifier.
+        """
+        import re
+
+        # Split into method and path
+        pattern_parts = pattern.split(" ", 1)
+        api_parts = api_identifier.split(" ", 1)
+
+        if len(pattern_parts) != 2 or len(api_parts) != 2:
+            return False
+
+        pattern_method, pattern_path = pattern_parts
+        api_method, api_path = api_parts
+
+        # Method must match exactly
+        if pattern_method.upper() != api_method.upper():
+            return False
+
+        # Convert pattern path to regex
+        # {param} -> [^/]+ (matches any segment)
+        # * -> .* (matches anything including slashes)
+        regex_pattern = re.escape(pattern_path)
+        regex_pattern = re.sub(r"\\{[^}]+\\}", r"[^/]+", regex_pattern)
+        regex_pattern = regex_pattern.replace(r"\*", r".*")
+        regex_pattern = f"^{regex_pattern}$"
+
+        return bool(re.match(regex_pattern, api_path))
+
     def _get_api_limit(self, api_identifier: str) -> Optional[RateLimitRule]:
-        """Get rate limit rule for an API."""
-        return self.config.apis.get(api_identifier)
+        """
+        Get rate limit rule for an API.
+
+        Priority:
+        1. Exact match in apis dict
+        2. Pattern match in api_patterns list (first match wins)
+        """
+        # Check exact match first
+        if api_identifier in self.config.apis:
+            return self.config.apis[api_identifier]
+
+        # Check pattern matches
+        for api_pattern in self.config.api_patterns:
+            if self._match_api_pattern(api_pattern.pattern, api_identifier):
+                return api_pattern.rule
+
+        return None
 
     def _reset_counter_if_needed(self, counter: Counter) -> None:
         """Reset counter if the window has passed (1 minute)."""
@@ -121,8 +247,10 @@ class RateLimiter:
         Returns:
             RateLimitStatus indicating if request is allowed or should queue.
         """
+        # Load user config outside of lock to avoid blocking
+        user_limit = await self._get_user_limit(user_id)
+
         async with self._lock:
-            user_limit = self._get_user_limit(user_id)
             api_limit = self._get_api_limit(api_identifier)
             global_limit = self.config.global_limit
 
@@ -404,8 +532,10 @@ class RateLimiter:
         Returns:
             RateLimitStatus indicating if more requests are allowed.
         """
+        # Load user config outside of lock to avoid blocking
+        user_limit = await self._get_user_limit(user_id)
+
         async with self._lock:
-            user_limit = self._get_user_limit(user_id)
             api_limit = self._get_api_limit(api_identifier)
             global_limit = self.config.global_limit
 
@@ -493,8 +623,10 @@ class RateLimiter:
         Returns:
             RateLimitStatus indicating if the increment was allowed.
         """
+        # Load user config outside of lock to avoid blocking
+        user_limit = await self._get_user_limit(user_id)
+
         async with self._lock:
-            user_limit = self._get_user_limit(user_id)
             api_limit = self._get_api_limit(api_identifier)
             global_limit = self.config.global_limit
 
@@ -551,4 +683,20 @@ class RateLimiter:
             queue_stats = self._queue.get_stats()
             stats["queue_size"] = queue_stats["queue_size"]
             stats["queue_by_priority"] = queue_stats["by_priority"]
+
+        # Add per-user statistics
+        user_stats = []
+        for user_id, concurrent in self._user_concurrent.items():
+            sse = self._user_sse_connections.get(user_id, 0)
+            user_counter = self._user_requests.get(user_id)
+            requests = user_counter.count if user_counter else 0
+            if concurrent > 0 or sse > 0 or requests > 0:
+                user_stats.append({
+                    "user_id": user_id,
+                    "concurrent": concurrent,
+                    "sse_connections": sse,
+                    "requests_this_minute": requests,
+                })
+        stats["user_stats"] = user_stats
+
         return stats

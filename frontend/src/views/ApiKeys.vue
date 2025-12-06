@@ -26,7 +26,13 @@ const includeExpired = ref(false)
 const createForm = ref({
   description: '',
   priority: 'normal',
-  expires_in_days: null
+  expires_in_days: null,
+  enableRateLimit: false,
+  rate_limit_config: {
+    max_concurrent: null,
+    max_requests_per_minute: null,
+    max_sse_connections: null
+  }
 })
 
 // Load data
@@ -62,13 +68,35 @@ const handleCreate = async () => {
       data.expires_in_days = parseInt(createForm.value.expires_in_days)
     }
 
+    // Add rate limit config if enabled
+    if (createForm.value.enableRateLimit) {
+      const rlConfig = {}
+      const rl = createForm.value.rate_limit_config
+      if (rl.max_concurrent) rlConfig.max_concurrent = parseInt(rl.max_concurrent)
+      if (rl.max_requests_per_minute) rlConfig.max_requests_per_minute = parseInt(rl.max_requests_per_minute)
+      if (rl.max_sse_connections) rlConfig.max_sse_connections = parseInt(rl.max_sse_connections)
+      if (Object.keys(rlConfig).length > 0) {
+        data.rate_limit_config = rlConfig
+      }
+    }
+
     const response = await createApiKey(data)
     createdKey.value = response.data.key
     showCreateDialog.value = false
     showKeyDialog.value = true
 
     // Reset form
-    createForm.value = { description: '', priority: 'normal', expires_in_days: null }
+    createForm.value = {
+      description: '',
+      priority: 'normal',
+      expires_in_days: null,
+      enableRateLimit: false,
+      rate_limit_config: {
+        max_concurrent: null,
+        max_requests_per_minute: null,
+        max_sse_connections: null
+      }
+    }
 
     await loadApiKeys()
     ElMessage.success('API Key created')
@@ -307,8 +335,8 @@ const getPriorityType = (priority) => {
     </el-card>
 
     <!-- Create Dialog -->
-    <el-dialog v-model="showCreateDialog" title="Create API Key" width="500">
-      <el-form :model="createForm" label-width="120px">
+    <el-dialog v-model="showCreateDialog" title="Create API Key" width="550">
+      <el-form :model="createForm" label-width="140px">
         <el-form-item label="Description">
           <el-input
             v-model="createForm.description"
@@ -333,6 +361,41 @@ const getPriorityType = (priority) => {
             <template #append>days</template>
           </el-input>
         </el-form-item>
+
+        <el-divider />
+
+        <el-form-item label="Custom Rate Limit">
+          <el-switch v-model="createForm.enableRateLimit" />
+          <span style="margin-left: 10px; color: #909399; font-size: 12px">
+            Override default limits for this key
+          </span>
+        </el-form-item>
+
+        <template v-if="createForm.enableRateLimit">
+          <el-form-item label="Max Concurrent">
+            <el-input
+              v-model="createForm.rate_limit_config.max_concurrent"
+              type="number"
+              placeholder="Leave empty to use default"
+            />
+          </el-form-item>
+
+          <el-form-item label="Requests/Min">
+            <el-input
+              v-model="createForm.rate_limit_config.max_requests_per_minute"
+              type="number"
+              placeholder="Leave empty to use default"
+            />
+          </el-form-item>
+
+          <el-form-item label="Max SSE Connections">
+            <el-input
+              v-model="createForm.rate_limit_config.max_sse_connections"
+              type="number"
+              placeholder="Leave empty to use default"
+            />
+          </el-form-item>
+        </template>
       </el-form>
 
       <template #footer>

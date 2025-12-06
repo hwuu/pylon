@@ -209,4 +209,5 @@ __marimo__/
 .claude/
 nul
 
+data/
 config.yaml

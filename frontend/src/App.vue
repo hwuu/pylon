@@ -12,7 +12,8 @@ const isLoginPage = computed(() => route.path === '/login')
 const menuItems = [
   { path: '/api-keys', title: 'API Keys', icon: 'Key' },
   { path: '/monitor', title: 'Monitor', icon: 'Monitor' },
-  { path: '/stats', title: 'Stats', icon: 'DataAnalysis' }
+  { path: '/stats', title: 'Stats', icon: 'DataAnalysis' },
+  { path: '/settings', title: 'Settings', icon: 'Setting' }
 ]
 
 const handleLogout = () => {

@@ -24,18 +24,21 @@ router = APIRouter()
 _admin_auth_service: Optional[AdminAuthService] = None
 _session_factory = None
 _rate_limiter = None
+_config = None
 
 
 def set_dependencies(
     admin_auth_service: AdminAuthService,
     session_factory,
     rate_limiter=None,
+    config=None,
 ):
     """Set the dependencies for the admin routes."""
-    global _admin_auth_service, _session_factory, _rate_limiter
+    global _admin_auth_service, _session_factory, _rate_limiter, _config
     _admin_auth_service = admin_auth_service
     _session_factory = session_factory
     _rate_limiter = rate_limiter
+    _config = config
 
 
 # ============== Request/Response Models ==============
@@ -104,12 +107,21 @@ class ApiKeyCountResponse(BaseModel):
     revoked: int
 
 
+class UserMonitorStats(BaseModel):
+    """Per-user monitoring statistics."""
+    user_id: str
+    concurrent: int
+    sse_connections: int
+    requests_this_minute: int
+
+
 class MonitorResponse(BaseModel):
     """Real-time monitoring data."""
     global_concurrent: int
     global_sse_connections: int
     global_requests_this_minute: int
     queue_size: int = 0
+    user_stats: List[UserMonitorStats] = []
 
 
 class StatsResponse(BaseModel):
@@ -461,14 +473,20 @@ async def get_monitor_data():
             global_sse_connections=0,
             global_requests_this_minute=0,
             queue_size=0,
+            user_stats=[],
         )
 
     stats = _rate_limiter.get_stats()
+    user_stats = [
+        UserMonitorStats(**user_stat)
+        for user_stat in stats.get("user_stats", [])
+    ]
     return MonitorResponse(
         global_concurrent=stats.get("global_concurrent", 0),
         global_sse_connections=stats.get("global_sse_connections", 0),
         global_requests_this_minute=stats.get("global_requests_this_minute", 0),
         queue_size=stats.get("queue_size", 0),
+        user_stats=user_stats,
     )
 
 
@@ -741,3 +759,66 @@ def _generate_html_report(summary: dict, users: List[dict], apis: List[dict]) ->
 </body>
 </html>
 """
+
+
+# ============== Config Routes ==============
+
+class RateLimitRuleResponse(BaseModel):
+    """Rate limit rule response."""
+    max_concurrent: Optional[int] = None
+    max_requests_per_minute: Optional[int] = None
+    max_sse_connections: Optional[int] = None
+
+
+class ConfigResponse(BaseModel):
+    """System configuration response."""
+    server: dict
+    downstream: dict
+    rate_limit: dict
+    queue: dict
+    sse: dict
+    data_retention: dict
+
+
+@router.get("/config", response_model=ConfigResponse, dependencies=[Depends(require_auth)])
+async def get_config():
+    """
+    Get current system configuration (read-only).
+    """
+    if not _config:
+        raise HTTPException(status_code=503, detail="Config not available")
+
+    return ConfigResponse(
+        server={
+            "proxy_port": _config.server.proxy_port,
+            "admin_port": _config.server.admin_port,
+            "host": _config.server.host,
+        },
+        downstream={
+            "base_url": _config.downstream.base_url,
+            "timeout": _config.downstream.timeout,
+        },
+        rate_limit={
+            "global": {
+                "max_concurrent": _config.rate_limit.global_limit.max_concurrent,
+                "max_requests_per_minute": _config.rate_limit.global_limit.max_requests_per_minute,
+                "max_sse_connections": _config.rate_limit.global_limit.max_sse_connections,
+            },
+            "default_user": {
+                "max_concurrent": _config.rate_limit.default_user.max_concurrent,
+                "max_requests_per_minute": _config.rate_limit.default_user.max_requests_per_minute,
+                "max_sse_connections": _config.rate_limit.default_user.max_sse_connections,
+            },
+        },
+        queue={
+            "max_size": _config.queue.max_size,
+            "timeout": _config.queue.timeout,
+        },
+        sse={
+            "idle_timeout": _config.sse.idle_timeout,
+        },
+        data_retention={
+            "days": _config.data_retention.days,
+            "cleanup_interval_hours": _config.data_retention.cleanup_interval_hours,
+        },
+    )

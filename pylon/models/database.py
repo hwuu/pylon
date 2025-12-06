@@ -2,6 +2,8 @@
 Database setup and session management.
 """
 
+from pathlib import Path
+
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
@@ -49,6 +51,11 @@ def create_db_engine(config: DatabaseConfig):
 
 def create_async_db_engine(config: DatabaseConfig):
     """Create an async database engine."""
+    # Ensure parent directory exists for SQLite
+    if config.type == "sqlite" and config.path:
+        db_path = Path(config.path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
     url = get_async_database_url(config)
     return create_async_engine(url, echo=False)
 

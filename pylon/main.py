@@ -76,8 +76,8 @@ def create_admin_app(config: Config, session_factory, rate_limiter) -> FastAPI:
         # Initialize admin auth service
         admin_auth_service = AdminAuthService(config.admin)
 
-        # Set dependencies for admin routes
-        admin_api.set_dependencies(admin_auth_service, session_factory, rate_limiter)
+        # Set dependencies for admin routes (including config for Settings page)
+        admin_api.set_dependencies(admin_auth_service, session_factory, rate_limiter, config)
 
         app.state.admin_auth_service = admin_auth_service
 
@@ -107,6 +107,23 @@ async def run_servers(config: Config):
 
     session_factory = create_async_session_factory(engine)
     rate_limiter = RateLimiter(config.rate_limit, config.queue)
+
+    # Create user config loader callback for rate limiter
+    async def load_user_rate_limit_config(user_id: str):
+        """Load user's rate_limit_config from database."""
+        from sqlalchemy import select
+        from pylon.models.api_key import ApiKey
+
+        async with session_factory() as session:
+            result = await session.execute(
+                select(ApiKey.rate_limit_config).where(ApiKey.id == user_id)
+            )
+            row = result.first()
+            if row and row[0]:
+                return row[0]
+            return None
+
+    rate_limiter.set_user_config_loader(load_user_rate_limit_config)
 
     # Initialize cleanup service
     cleanup_service = CleanupService(session_factory, config.data_retention)
@@ -144,18 +161,8 @@ async def run_servers(config: Config):
         await cleanup_service.stop()
 
 
-def main():
-    """Main entry point."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Pylon HTTP API Proxy")
-    parser.add_argument(
-        "-c", "--config",
-        default="config.yaml",
-        help="Path to configuration file (default: config.yaml)",
-    )
-    args = parser.parse_args()
-
+def cmd_serve(args):
+    """Run the proxy and admin servers."""
     # Load config
     config_path = Path(args.config)
     if not config_path.exists():
@@ -178,6 +185,74 @@ def main():
         logger.info("Received interrupt, shutting down...")
 
     return 0
+
+
+def cmd_hash_password(args):
+    """Generate bcrypt hash for admin password."""
+    import getpass
+    from pylon.utils import hash_password
+
+    try:
+        password = getpass.getpass("Enter password: ")
+        if not password:
+            print("Error: Password cannot be empty")
+            return 1
+
+        password_confirm = getpass.getpass("Confirm password: ")
+        if password != password_confirm:
+            print("Error: Passwords do not match")
+            return 1
+
+        hashed = hash_password(password)
+        print(f"\nGenerated password hash:")
+        print(hashed)
+        print(f"\nAdd this to your config.yaml:")
+        print(f'admin:')
+        print(f'  password_hash: "{hashed}"')
+
+    except KeyboardInterrupt:
+        print("\nCancelled")
+        return 1
+
+    return 0
+
+
+def main():
+    """Main entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Pylon HTTP API Proxy",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # serve command (default)
+    serve_parser = subparsers.add_parser("serve", help="Run the proxy and admin servers")
+    serve_parser.add_argument(
+        "-c", "--config",
+        default="config.yaml",
+        help="Path to configuration file (default: config.yaml)",
+    )
+
+    # hash-password command
+    subparsers.add_parser("hash-password", help="Generate bcrypt hash for admin password")
+
+    args = parser.parse_args()
+
+    # Default to serve if no command specified
+    if args.command is None:
+        # Re-parse with serve as default
+        args.command = "serve"
+        args.config = "config.yaml"
+
+    if args.command == "serve":
+        return cmd_serve(args)
+    elif args.command == "hash-password":
+        return cmd_hash_password(args)
+    else:
+        parser.print_help()
+        return 1
 
 
 if __name__ == "__main__":

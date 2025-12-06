@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Request, Response, HTTPException
@@ -13,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pylon.models.api_key import ApiKey
+from pylon.models.request_log import RequestLog
 from pylon.services.auth import AuthService, extract_api_key_from_header
 from pylon.services.proxy import ProxyService, get_api_identifier
 from pylon.services.rate_limiter import RateLimiter, RateLimitResult
@@ -50,6 +52,38 @@ async def get_db_session():
     """Get a database session."""
     async with _session_factory() as session:
         yield session
+
+
+async def _save_request_log(
+    api_key_id: str,
+    api_identifier: str,
+    request_path: str,
+    request_method: str,
+    response_status: int,
+    response_time_ms: int,
+    client_ip: str,
+    is_sse: bool = False,
+    sse_message_count: int = 0,
+) -> None:
+    """Save request log to database."""
+    try:
+        async with _session_factory() as session:
+            log = RequestLog(
+                api_key_id=api_key_id,
+                api_identifier=api_identifier,
+                request_path=request_path,
+                request_method=request_method,
+                response_status=response_status,
+                request_time=datetime.now(timezone.utc),
+                response_time_ms=response_time_ms,
+                client_ip=client_ip,
+                is_sse=is_sse,
+                sse_message_count=sse_message_count,
+            )
+            session.add(log)
+            await session.commit()
+    except Exception as e:
+        logger.error(f"Failed to save request log: {e}")
 
 
 @router.get("/health")
@@ -206,85 +240,121 @@ async def proxy_request(
     Supports both regular HTTP requests and SSE (Server-Sent Events) streams.
     Implements priority queue for waiting when concurrency is full.
     """
-    if not _proxy_service or not _session_factory:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "service_unavailable", "message": "Proxy not configured"},
-        )
+    start_time = time.time()
+    api_key_id = None
+    api_identifier = None
+    body = b""
 
-    # Get request body early to detect SSE
-    body = await request.body()
-    is_sse = _is_sse_request(request, body)
-
-    # Get database session
-    async with _session_factory() as session:
-        # Authenticate
-        api_key = await authenticate_request(request, session)
-
-        # Get API identifier
-        full_path = f"/{path}"
-        if request.url.query:
-            full_path = f"{full_path}?{request.url.query}"
-        api_identifier = get_api_identifier(request.method, full_path)
-
-        # Check rate limits - may need to queue
-        should_queue = await check_rate_limits(api_key, api_identifier, is_sse=is_sse)
-
-        if should_queue:
-            # Wait in priority queue for a slot
-            await wait_in_queue(api_key)
-            # Queue already acquired global concurrent slot, just update user counters
-            await _rate_limiter.acquire(
-                api_key.id, api_identifier, is_sse=is_sse, skip_global_concurrent=True
+    try:
+        if not _proxy_service or not _session_factory:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "service_unavailable", "message": "Proxy not configured"},
             )
-        else:
-            # Acquire rate limit slot directly
-            await _rate_limiter.acquire(api_key.id, api_identifier, is_sse=is_sse)
 
-        # Get headers as dict
-        headers = dict(request.headers)
+        # Get request body early to detect SSE
+        body = await request.body()
+        is_sse = _is_sse_request(request, body)
 
-        if is_sse:
-            # Handle SSE request
-            return await _handle_sse_request(
-                api_key=api_key,
-                api_identifier=api_identifier,
-                method=request.method,
-                path=f"/{path}",
-                headers=headers,
-                body=body,
-                query_params=dict(request.query_params) if request.query_params else None,
-            )
-        else:
-            # Handle regular request
-            try:
-                # Forward request
-                start_time = time.time()
-                response = await _proxy_service.forward_request(
+        # Get database session
+        async with _session_factory() as session:
+            # Authenticate
+            api_key = await authenticate_request(request, session)
+            api_key_id = api_key.id
+
+            # Get API identifier
+            full_path = f"/{path}"
+            if request.url.query:
+                full_path = f"{full_path}?{request.url.query}"
+            api_identifier = get_api_identifier(request.method, full_path)
+
+            # Check rate limits - may need to queue
+            should_queue = await check_rate_limits(api_key, api_identifier, is_sse=is_sse)
+
+            if should_queue:
+                # Wait in priority queue for a slot
+                await wait_in_queue(api_key)
+                # Queue already acquired global concurrent slot, just update user counters
+                await _rate_limiter.acquire(
+                    api_key.id, api_identifier, is_sse=is_sse, skip_global_concurrent=True
+                )
+            else:
+                # Acquire rate limit slot directly
+                await _rate_limiter.acquire(api_key.id, api_identifier, is_sse=is_sse)
+
+            # Get headers as dict
+            headers = dict(request.headers)
+
+            if is_sse:
+                # Handle SSE request
+                return await _handle_sse_request(
+                    api_key=api_key,
+                    api_identifier=api_identifier,
                     method=request.method,
                     path=f"/{path}",
                     headers=headers,
-                    content=body if body else None,
+                    body=body,
                     query_params=dict(request.query_params) if request.query_params else None,
+                    client_ip=request.client.host if request.client else "unknown",
+                    start_time=start_time,
                 )
-                elapsed_ms = int((time.time() - start_time) * 1000)
+            else:
+                # Handle regular request
+                try:
+                    # Forward request
+                    response = await _proxy_service.forward_request(
+                        method=request.method,
+                        path=f"/{path}",
+                        headers=headers,
+                        content=body if body else None,
+                        query_params=dict(request.query_params) if request.query_params else None,
+                    )
+                    elapsed_ms = int((time.time() - start_time) * 1000)
 
-                # Build response headers (filter hop-by-hop)
-                response_headers = {}
-                skip_headers = {"connection", "keep-alive", "transfer-encoding", "content-encoding"}
-                for key, value in response.headers.items():
-                    if key.lower() not in skip_headers:
-                        response_headers[key] = value
+                    # Log successful request
+                    logger.info(
+                        f"[{api_key_id[:8]}] {api_identifier} -> {response.status_code} "
+                        f"({elapsed_ms}ms, req={len(body)}B, res={len(response.content)}B)"
+                    )
 
-                return Response(
-                    content=response.content,
-                    status_code=response.status_code,
-                    headers=response_headers,
-                )
+                    # Save request log to database
+                    await _save_request_log(
+                        api_key_id=api_key.id,
+                        api_identifier=api_identifier,
+                        request_path=f"/{path}",
+                        request_method=request.method,
+                        response_status=response.status_code,
+                        response_time_ms=elapsed_ms,
+                        client_ip=request.client.host if request.client else "unknown",
+                    )
 
-            finally:
-                # Release rate limit slot
-                await _rate_limiter.release(api_key.id, api_identifier)
+                    # Build response headers (filter hop-by-hop)
+                    response_headers = {}
+                    skip_headers = {"connection", "keep-alive", "transfer-encoding", "content-encoding"}
+                    for key, value in response.headers.items():
+                        if key.lower() not in skip_headers:
+                            response_headers[key] = value
+
+                    return Response(
+                        content=response.content,
+                        status_code=response.status_code,
+                        headers=response_headers,
+                    )
+
+                finally:
+                    # Release rate limit slot
+                    await _rate_limiter.release(api_key.id, api_identifier)
+
+    except HTTPException as e:
+        # Log error responses
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        key_prefix = f"[{api_key_id[:8]}]" if api_key_id else "[no-key]"
+        api_info = api_identifier or f"{request.method} /{path}"
+        logger.warning(
+            f"{key_prefix} {api_info} -> {e.status_code} "
+            f"({elapsed_ms}ms, req={len(body)}B, err={e.detail})"
+        )
+        raise
 
 
 async def _handle_sse_request(
@@ -295,11 +365,19 @@ async def _handle_sse_request(
     headers: dict,
     body: bytes,
     query_params: Optional[dict],
+    client_ip: str,
+    start_time: float,
 ) -> StreamingResponse:
     """Handle SSE streaming request."""
 
+    # Track SSE metrics
+    total_bytes = 0
+    message_count = 0
+    response_status = 200
+
     async def generate():
         """Generate SSE stream with idle timeout and message rate limiting."""
+        nonlocal total_bytes, message_count, response_status
         last_data_time = time.time()
 
         try:
@@ -314,7 +392,6 @@ async def _handle_sse_request(
 
             # First yield gets metadata
             first = True
-            response_status = 200
             response_headers = {}
 
             async for chunk, status, hdrs in stream:
@@ -322,6 +399,11 @@ async def _handle_sse_request(
                     first = False
                     response_status = status
                     response_headers = hdrs
+
+                    # Log SSE connection start
+                    logger.info(
+                        f"[{api_key.id[:8]}] SSE {api_identifier} -> {response_status} (started, req={len(body)}B)"
+                    )
 
                     # If downstream returned error, don't stream
                     if status >= 400:
@@ -339,8 +421,10 @@ async def _handle_sse_request(
 
                 # Count SSE data events (lines starting with "data:")
                 if chunk:
+                    total_bytes += len(chunk)
                     chunk_str = chunk.decode("utf-8", errors="replace")
                     data_count = chunk_str.count("data:")
+                    message_count += data_count
 
                     # Rate limit each SSE message
                     for _ in range(data_count):
@@ -385,6 +469,26 @@ async def _handle_sse_request(
             ).encode("utf-8")
 
         finally:
+            # Log SSE connection end
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            logger.info(
+                f"[{api_key.id[:8]}] SSE {api_identifier} ended "
+                f"({elapsed_ms}ms, {message_count} msgs, {total_bytes}B)"
+            )
+
+            # Save request log to database
+            await _save_request_log(
+                api_key_id=api_key.id,
+                api_identifier=api_identifier,
+                request_path=path,
+                request_method=method,
+                response_status=response_status,
+                response_time_ms=elapsed_ms,
+                client_ip=client_ip,
+                is_sse=True,
+                sse_message_count=message_count,
+            )
+
             # Release SSE connection slot
             await _rate_limiter.release(api_key.id, api_identifier, is_sse=True)
 

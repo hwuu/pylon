@@ -24,6 +24,7 @@ class ProxyService:
                 base_url=self.base_url,
                 timeout=httpx.Timeout(self.timeout),
                 follow_redirects=True,
+                trust_env=False,  # Disable system proxy
             )
         return self._client
 

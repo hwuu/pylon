@@ -3,12 +3,50 @@ Mock downstream server for end-to-end testing.
 """
 
 import asyncio
-from fastapi import FastAPI, HTTPException, Request
+import json
+import logging
+import time
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("mock_server")
+
+
 app = FastAPI(title="Mock Downstream API")
+
+
+class LoggingMiddleware(BaseHTTPMiddleware):
+    """Middleware to log all requests."""
+
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+
+        # Read request body
+        body = await request.body()
+
+        # Process request
+        response = await call_next(request)
+
+        # Calculate elapsed time
+        elapsed_ms = int((time.time() - start_time) * 1000)
+
+        # Log request
+        logger.info(
+            f"{request.method} {request.url.path} -> {response.status_code} "
+            f"({elapsed_ms}ms, req={len(body)}B)"
+        )
+
+        return response
+
+
+app.add_middleware(LoggingMiddleware)
 
 
 @app.get("/api/hello")
@@ -75,7 +113,7 @@ async def chat_completions(request: Request):
                         }
                     ]
                 }
-                yield f"data: {chunk}\n\n"
+                yield f"data: {json.dumps(chunk)}\n\n"
                 await asyncio.sleep(0.2)
             yield "data: [DONE]\n\n"
 
@@ -119,7 +157,7 @@ async def list_models():
 
 def run_mock_server(port: int = 9999):
     """Run the mock server."""
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
 
 
 if __name__ == "__main__":
