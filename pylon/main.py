@@ -14,13 +14,15 @@ from pylon.config import load_config, Config
 from pylon.models import init_db, create_async_db_engine, create_async_session_factory
 from pylon.services.proxy import ProxyService
 from pylon.services.rate_limiter import RateLimiter
+from pylon.services.admin_auth import AdminAuthService
 from pylon.api import proxy as proxy_api
+from pylon.api import admin as admin_api
 
 
 logger = logging.getLogger(__name__)
 
 
-def create_proxy_app(config: Config) -> FastAPI:
+def create_proxy_app(config: Config, engine, session_factory, rate_limiter) -> FastAPI:
     """Create the proxy FastAPI application."""
 
     @asynccontextmanager
@@ -28,17 +30,8 @@ def create_proxy_app(config: Config) -> FastAPI:
         # Startup
         logger.info("Starting Pylon proxy server...")
 
-        # Initialize database
-        engine = create_async_db_engine(config.database)
-        async with engine.begin() as conn:
-            from pylon.models.database import Base
-            await conn.run_sync(Base.metadata.create_all)
-
-        session_factory = create_async_session_factory(engine)
-
         # Initialize services
         proxy_service = ProxyService(config.downstream)
-        rate_limiter = RateLimiter(config.rate_limit)
 
         # Set dependencies for routes
         proxy_api.set_dependencies(
@@ -72,12 +65,21 @@ def create_proxy_app(config: Config) -> FastAPI:
     return app
 
 
-def create_admin_app(config: Config) -> FastAPI:
+def create_admin_app(config: Config, session_factory, rate_limiter) -> FastAPI:
     """Create the admin FastAPI application."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("Starting Pylon admin server...")
+
+        # Initialize admin auth service
+        admin_auth_service = AdminAuthService(config.admin)
+
+        # Set dependencies for admin routes
+        admin_api.set_dependencies(admin_auth_service, session_factory, rate_limiter)
+
+        app.state.admin_auth_service = admin_auth_service
+
         yield
         logger.info("Shutting down Pylon admin server...")
 
@@ -88,19 +90,26 @@ def create_admin_app(config: Config) -> FastAPI:
         lifespan=lifespan,
     )
 
-    @app.get("/health")
-    async def health():
-        return {"status": "ok"}
-
-    # TODO: Add admin routes
+    # Include admin routes
+    app.include_router(admin_api.router)
 
     return app
 
 
 async def run_servers(config: Config):
     """Run both proxy and admin servers."""
-    proxy_app = create_proxy_app(config)
-    admin_app = create_admin_app(config)
+    # Initialize shared resources first
+    engine = create_async_db_engine(config.database)
+    async with engine.begin() as conn:
+        from pylon.models.database import Base
+        await conn.run_sync(Base.metadata.create_all)
+
+    session_factory = create_async_session_factory(engine)
+    rate_limiter = RateLimiter(config.rate_limit)
+
+    # Create apps with shared resources
+    proxy_app = create_proxy_app(config, engine, session_factory, rate_limiter)
+    admin_app = create_admin_app(config, session_factory, rate_limiter)
 
     proxy_config = uvicorn.Config(
         proxy_app,
