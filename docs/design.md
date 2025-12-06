@@ -307,6 +307,7 @@ data: {"code": "rate_limit_exceeded", "message": "Request limit exceeded"}
 | `rate_limit_exceeded` | 请求频率超限 |
 | `idle_timeout` | 空闲超时断开 |
 | `downstream_error` | downstream 连接异常 |
+| `stream_error` | SSE 流处理异常 |
 
 ### 配置示例
 
@@ -569,6 +570,7 @@ pylon/
 │   │   ├── auth.py             # 认证服务
 │   │   ├── proxy.py            # 代理服务
 │   │   ├── rate_limiter.py     # 限流服务
+│   │   ├── queue.py            # 优先级队列
 │   │   └── stats.py            # 统计服务
 │   ├── api/
 │   │   ├── __init__.py
