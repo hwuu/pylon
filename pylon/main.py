@@ -15,6 +15,7 @@ from pylon.models import init_db, create_async_db_engine, create_async_session_f
 from pylon.services.proxy import ProxyService
 from pylon.services.rate_limiter import RateLimiter
 from pylon.services.admin_auth import AdminAuthService
+from pylon.services.cleanup import CleanupService
 from pylon.api import proxy as proxy_api
 from pylon.api import admin as admin_api
 
@@ -107,6 +108,10 @@ async def run_servers(config: Config):
     session_factory = create_async_session_factory(engine)
     rate_limiter = RateLimiter(config.rate_limit, config.queue)
 
+    # Initialize cleanup service
+    cleanup_service = CleanupService(session_factory, config.data_retention)
+    cleanup_service.start()
+
     # Create apps with shared resources
     proxy_app = create_proxy_app(config, engine, session_factory, rate_limiter)
     admin_app = create_admin_app(config, session_factory, rate_limiter)
@@ -130,10 +135,13 @@ async def run_servers(config: Config):
     logger.info(f"Proxy server: http://{config.server.host}:{config.server.proxy_port}")
     logger.info(f"Admin server: http://{config.server.host}:{config.server.admin_port}")
 
-    await asyncio.gather(
-        proxy_server.serve(),
-        admin_server.serve(),
-    )
+    try:
+        await asyncio.gather(
+            proxy_server.serve(),
+            admin_server.serve(),
+        )
+    finally:
+        await cleanup_service.stop()
 
 
 def main():
