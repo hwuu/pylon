@@ -1,59 +1,22 @@
 # config.example.yaml
-# Copy this file to config.yaml and modify as needed
+# Static configuration - Copy this file to config.yaml and modify as needed
+# These settings require server restart to take effect
 
 server:
   proxy_port: 8000
   admin_port: 8001
   host: "0.0.0.0"
 
-downstream:
-  base_url: "https://api.example.com"
-  timeout: 30
-
 database:
-  type: "sqlite"
-  path: "./data/pylon.db"
-
-  # PostgreSQL (alternative)
-  # type: "postgresql"
-  # host: "localhost"
-  # port: 5432
-  # database: "pylon"
-  # username: "pylon"
-  # password: "secret"
+  url: "sqlite+aiosqlite:///./data/pylon.db"
+  # PostgreSQL example:
+  # url: "postgresql+asyncpg://user:password@localhost:5432/pylon"
 
 admin:
   # Generate with: python -m pylon hash-password
   password_hash: "$2b$12$placeholder..."
   jwt_secret: "change-this-to-a-random-secret"
   jwt_expire_hours: 24
-
-rate_limit:
-  global:
-    max_concurrent: 50
-    max_requests_per_minute: 500
-    max_sse_connections: 20
-
-  default_user:
-    max_concurrent: 4
-    max_requests_per_minute: 60
-    max_sse_connections: 2
-
-  apis: {}
-    # Example:
-    # "POST /v1/chat/completions":
-    #   max_requests_per_minute: 100
-
-queue:
-  max_size: 100
-  timeout: 30
-
-sse:
-  idle_timeout: 60
-
-data_retention:
-  days: 30
-  cleanup_interval_hours: 24
 
 logging:
   level: "INFO"

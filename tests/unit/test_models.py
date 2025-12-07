@@ -17,7 +17,8 @@ def db_session():
     """Create a temporary database session for testing."""
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test.db")
-        config = DatabaseConfig(type="sqlite", path=db_path)
+        # Use the new DatabaseConfig format with url
+        config = DatabaseConfig(url=f"sqlite:///{db_path}")
         engine = create_db_engine(config)
         Base.metadata.create_all(engine)
         Session = create_session_factory(engine)

@@ -3,17 +3,17 @@ Admin API routes.
 """
 
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Any
 
-from fastapi import APIRouter, Request, HTTPException, Depends
-from pydantic import BaseModel, Field
-
+from fastapi import APIRouter, Request, HTTPException, Depends, UploadFile, File
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 
 from pylon.config import AdminConfig
 from pylon.services.admin_auth import AdminAuthService
 from pylon.services.api_key_service import ApiKeyService
 from pylon.services.stats import StatsService
+from pylon.services.policy import PolicyService
 from pylon.models.api_key import Priority
 
 
@@ -25,6 +25,7 @@ _admin_auth_service: Optional[AdminAuthService] = None
 _session_factory = None
 _rate_limiter = None
 _config = None
+_policy_service: Optional[PolicyService] = None
 
 
 def set_dependencies(
@@ -32,13 +33,15 @@ def set_dependencies(
     session_factory,
     rate_limiter=None,
     config=None,
+    policy_service: Optional[PolicyService] = None,
 ):
     """Set the dependencies for the admin routes."""
-    global _admin_auth_service, _session_factory, _rate_limiter, _config
+    global _admin_auth_service, _session_factory, _rate_limiter, _config, _policy_service
     _admin_auth_service = admin_auth_service
     _session_factory = session_factory
     _rate_limiter = rate_limiter
     _config = config
+    _policy_service = policy_service
 
 
 # ============== Request/Response Models ==============
@@ -761,29 +764,18 @@ def _generate_html_report(summary: dict, users: List[dict], apis: List[dict]) ->
 """
 
 
-# ============== Config Routes ==============
-
-class RateLimitRuleResponse(BaseModel):
-    """Rate limit rule response."""
-    max_concurrent: Optional[int] = None
-    max_requests_per_minute: Optional[int] = None
-    max_sse_connections: Optional[int] = None
-
+# ============== Config Routes (Static - Read Only) ==============
 
 class ConfigResponse(BaseModel):
-    """System configuration response."""
+    """Static configuration response (read-only)."""
     server: dict
-    downstream: dict
-    rate_limit: dict
-    queue: dict
-    sse: dict
-    data_retention: dict
 
 
 @router.get("/config", response_model=ConfigResponse, dependencies=[Depends(require_auth)])
 async def get_config():
     """
-    Get current system configuration (read-only).
+    Get static configuration (read-only).
+    These values require server restart to change.
     """
     if not _config:
         raise HTTPException(status_code=503, detail="Config not available")
@@ -794,31 +786,136 @@ async def get_config():
             "admin_port": _config.server.admin_port,
             "host": _config.server.host,
         },
-        downstream={
-            "base_url": _config.downstream.base_url,
-            "timeout": _config.downstream.timeout,
-        },
-        rate_limit={
-            "global": {
-                "max_concurrent": _config.rate_limit.global_limit.max_concurrent,
-                "max_requests_per_minute": _config.rate_limit.global_limit.max_requests_per_minute,
-                "max_sse_connections": _config.rate_limit.global_limit.max_sse_connections,
-            },
-            "default_user": {
-                "max_concurrent": _config.rate_limit.default_user.max_concurrent,
-                "max_requests_per_minute": _config.rate_limit.default_user.max_requests_per_minute,
-                "max_sse_connections": _config.rate_limit.default_user.max_sse_connections,
-            },
-        },
-        queue={
-            "max_size": _config.queue.max_size,
-            "timeout": _config.queue.timeout,
-        },
-        sse={
-            "idle_timeout": _config.sse.idle_timeout,
-        },
-        data_retention={
-            "days": _config.data_retention.days,
-            "cleanup_interval_hours": _config.data_retention.cleanup_interval_hours,
-        },
     )
+
+
+# ============== Policy Routes (Dynamic - CRUD) ==============
+
+class PolicyResponse(BaseModel):
+    """Policy response."""
+    policies: dict[str, Any]
+
+
+class PolicyUpdateRequest(BaseModel):
+    """Request to update a single policy."""
+    value: Any
+
+
+class PolicyDiffResponse(BaseModel):
+    """Response showing diff between current and imported policies."""
+    added: dict[str, Any]
+    modified: dict[str, dict[str, Any]]  # key -> {"old": ..., "new": ...}
+    unchanged: dict[str, Any]
+
+
+class PolicyImportConfirmRequest(BaseModel):
+    """Request to confirm policy import."""
+    added: dict[str, Any] = {}
+    modified: dict[str, dict[str, Any]] = {}
+
+
+@router.get("/policy", response_model=PolicyResponse, dependencies=[Depends(require_auth)])
+async def get_all_policies():
+    """
+    Get all policy values.
+    """
+    if not _policy_service:
+        raise HTTPException(status_code=503, detail="Policy service not available")
+
+    policies = await _policy_service.get_all()
+    return PolicyResponse(policies=policies)
+
+
+@router.get("/policy/{key:path}", dependencies=[Depends(require_auth)])
+async def get_policy(key: str):
+    """
+    Get a single policy value.
+    """
+    if not _policy_service:
+        raise HTTPException(status_code=503, detail="Policy service not available")
+
+    value = await _policy_service.get(key)
+    if value is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "not_found", "message": f"Policy key not found: {key}"}
+        )
+
+    return {"key": key, "value": value}
+
+
+@router.put("/policy/{key:path}", dependencies=[Depends(require_auth)])
+async def update_policy(key: str, body: PolicyUpdateRequest):
+    """
+    Update a single policy value.
+    """
+    if not _policy_service:
+        raise HTTPException(status_code=503, detail="Policy service not available")
+
+    await _policy_service.set(key, body.value)
+    return {"key": key, "value": body.value}
+
+
+@router.post("/policy/export", dependencies=[Depends(require_auth)])
+async def export_policy():
+    """
+    Export all policies as YAML file.
+    """
+    if not _policy_service:
+        raise HTTPException(status_code=503, detail="Policy service not available")
+
+    yaml_content = await _policy_service.export_yaml()
+    return Response(
+        content=yaml_content,
+        media_type="application/x-yaml",
+        headers={"Content-Disposition": "attachment; filename=policy.yaml"},
+    )
+
+
+@router.post("/policy/import", response_model=PolicyDiffResponse, dependencies=[Depends(require_auth)])
+async def import_policy(file: UploadFile = File(...)):
+    """
+    Upload YAML file and get diff preview.
+    Does not apply changes - use /policy/import/confirm to apply.
+    """
+    if not _policy_service:
+        raise HTTPException(status_code=503, detail="Policy service not available")
+
+    # Read file content
+    content = await file.read()
+    try:
+        yaml_content = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_encoding", "message": "File must be UTF-8 encoded"}
+        )
+
+    # Parse and get diff
+    try:
+        diff = await _policy_service.parse_import(yaml_content)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_yaml", "message": str(e)}
+        )
+
+    return PolicyDiffResponse(**diff)
+
+
+@router.post("/policy/import/confirm", dependencies=[Depends(require_auth)])
+async def confirm_import_policy(body: PolicyImportConfirmRequest):
+    """
+    Confirm and apply imported policy changes.
+    """
+    if not _policy_service:
+        raise HTTPException(status_code=503, detail="Policy service not available")
+
+    changes = {
+        "added": body.added,
+        "modified": body.modified,
+    }
+
+    await _policy_service.apply_import(changes)
+
+    return {"message": "Policy imported successfully"}

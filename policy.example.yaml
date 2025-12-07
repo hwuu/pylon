@@ -1,0 +1,45 @@
+# policy.example.yaml
+# Dynamic policy configuration - Can be imported/exported via admin UI
+# These settings can be changed at runtime without restarting the server
+
+downstream:
+  base_url: "https://api.example.com"
+  timeout: 30
+
+rate_limit:
+  global:
+    max_concurrent: 50
+    max_requests_per_minute: 500
+    max_sse_connections: 20
+
+  default_user:
+    max_concurrent: 4
+    max_requests_per_minute: 60
+    max_sse_connections: 2
+
+  apis:
+    # Example: API-specific limits
+    # "POST /v1/chat/completions":
+    #   max_concurrent: 30
+    #   max_requests_per_minute: 100
+    #   max_sse_connections: 10
+
+  api_patterns:
+    # Example: Pattern-based limits
+    # - pattern: "GET /users/{id}"
+    #   rule:
+    #     max_requests_per_minute: 100
+    # - pattern: "POST /v1/*"
+    #   rule:
+    #     max_concurrent: 20
+
+queue:
+  max_size: 100
+  timeout: 30
+
+sse:
+  idle_timeout: 60
+
+data_retention:
+  days: 30
+  cleanup_interval_hours: 24

@@ -15,7 +15,8 @@
 - [9. 查看监控数据](#9-查看监控数据)
 - [10. 查看统计报告](#10-查看统计报告)
 - [11. 导出统计数据](#11-导出统计数据)
-- [12. 前端界面使用](#12-前端界面使用)
+- [12. 策略配置管理](#12-策略配置管理)
+- [13. 前端界面使用](#13-前端界面使用)
 
 ---
 
@@ -57,14 +58,14 @@ curl http://localhost:9999/v1/models
 ### 3.1 生成管理员密码哈希
 
 ```bash
-python -c "from pylon.utils.crypto import hash_password; print(hash_password('admin123'))"
+python -m pylon hash-password
 ```
 
-记录输出的哈希值（类似 `$2b$12$...`）。
+按提示输入密码，记录输出的哈希值（类似 `$2b$12$...`）。
 
 ### 3.2 创建配置文件
 
-创建 `config.yaml`：
+创建 `config.yaml`（静态配置）：
 
 ```yaml
 server:
@@ -72,40 +73,19 @@ server:
   admin_port: 8001
   host: "127.0.0.1"
 
-downstream:
-  base_url: "http://localhost:9999"
-  timeout: 30
-
 database:
-  type: "sqlite"
-  path: "./data/pylon.db"
+  url: "sqlite+aiosqlite:///./data/pylon.db"
 
 admin:
   password_hash: "$2b$12$你的密码哈希"  # 替换为上一步生成的哈希
   jwt_secret: "your-secret-key-change-in-production"
   jwt_expire_hours: 24
 
-rate_limit:
-  global:
-    max_concurrent: 10
-    max_requests_per_minute: 60
-    max_sse_connections: 5
-  default_user:
-    max_concurrent: 2
-    max_requests_per_minute: 10
-    max_sse_connections: 1
-
-queue:
-  max_size: 20
-  timeout: 10
-
-sse:
-  idle_timeout: 30
-
-data_retention:
-  days: 30
-  cleanup_interval_hours: 24
+logging:
+  level: "INFO"
 ```
+
+**注意**：策略配置（如 downstream、rate_limit 等）存储在数据库中，首次启动时会自动初始化为默认值。可以通过管理界面或 API 修改，也可以导入 YAML 文件。
 
 ---
 
@@ -264,13 +244,13 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 ## 8. 触发限流
 
-根据配置 `default_user.max_requests_per_minute: 10`，快速发送请求触发限流。
+根据默认策略 `rate_limit.default_user.max_requests_per_minute: 60`，快速发送请求触发限流。
 
 ### 8.1 快速发送多个请求
 
 ```bash
-# 使用循环快速发送 15 个请求
-for i in {1..15}; do
+# 使用循环快速发送 65 个请求
+for i in {1..65}; do
   echo "Request $i:"
   curl -s -o /dev/null -w "%{http_code}\n" \
     http://localhost:8000/api/hello \
@@ -278,7 +258,7 @@ for i in {1..15}; do
 done
 ```
 
-预期：前 10 个请求返回 200，之后的请求返回 429。
+预期：前 60 个请求返回 200，之后的请求返回 429。
 
 ### 8.2 查看限流响应
 
@@ -306,11 +286,11 @@ curl http://localhost:8000/api/slow -H "Authorization: Bearer $API_KEY"
 # 终端 B（同时执行）
 curl http://localhost:8000/api/slow -H "Authorization: Bearer $API_KEY"
 
-# 终端 C（同时执行）- 会进入队列
+# 终端 C-E（同时执行）- 会进入队列
 curl http://localhost:8000/api/slow -H "Authorization: Bearer $API_KEY"
 ```
 
-根据 `default_user.max_concurrent: 2`，第三个请求会进入队列等待。
+根据默认策略 `rate_limit.default_user.max_concurrent: 4`，超出并发的请求会进入队列等待。
 
 ---
 
@@ -413,9 +393,98 @@ start stats.html # Windows
 
 ---
 
-## 12. 前端界面使用
+## 12. 策略配置管理
 
-### 12.1 启动前端开发服务器
+策略配置（Policy）存储在数据库中，支持热更新。
+
+### 12.1 查看当前策略
+
+```bash
+curl http://localhost:8001/policy \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+预期输出：
+```json
+{
+  "policies": {
+    "downstream.base_url": "",
+    "downstream.timeout": 30,
+    "rate_limit.global": {"max_concurrent": 50, "max_requests_per_minute": 500, "max_sse_connections": 20},
+    "rate_limit.default_user": {"max_concurrent": 4, "max_requests_per_minute": 60, "max_sse_connections": 2},
+    "rate_limit.apis": {},
+    "rate_limit.api_patterns": [],
+    "queue.max_size": 100,
+    "queue.timeout": 30,
+    "sse.idle_timeout": 60,
+    "data_retention.days": 30,
+    "data_retention.cleanup_interval_hours": 24
+  }
+}
+```
+
+### 12.2 修改单个策略
+
+```bash
+# 修改下游 API 地址
+curl -X PUT http://localhost:8001/policy/downstream.base_url \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"value": "http://localhost:9999"}'
+
+# 修改用户默认并发限制
+curl -X PUT http://localhost:8001/policy/rate_limit.default_user \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"value": {"max_concurrent": 8, "max_requests_per_minute": 120, "max_sse_connections": 4}}'
+```
+
+### 12.3 导出策略为 YAML
+
+```bash
+curl -X POST http://localhost:8001/policy/export \
+  -H "Authorization: Bearer $TOKEN" \
+  -o policy.yaml
+```
+
+### 12.4 导入策略（预览差异）
+
+```bash
+curl -X POST http://localhost:8001/policy/import \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@policy.yaml"
+```
+
+预期输出（显示差异）：
+```json
+{
+  "added": {},
+  "modified": {
+    "downstream.base_url": {
+      "old": "",
+      "new": "http://localhost:9999"
+    }
+  },
+  "unchanged": {
+    "queue.max_size": 100
+  }
+}
+```
+
+### 12.5 确认导入策略
+
+```bash
+curl -X POST http://localhost:8001/policy/import/confirm \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"added": {}, "modified": {"downstream.base_url": {"old": "", "new": "http://localhost:9999"}}}'
+```
+
+---
+
+## 13. 前端界面使用
+
+### 13.1 启动前端开发服务器
 
 ```bash
 cd frontend
@@ -424,12 +493,12 @@ npm run dev
 
 访问 http://localhost:5173
 
-### 12.2 登录
+### 13.2 登录
 
 - 输入密码：`admin123`（或你配置的密码）
 - 点击 Login
 
-### 12.3 API Key 管理
+### 13.3 API Key 管理
 
 - 点击侧边栏 "API Keys"
 - 点击 "Create API Key" 创建新 Key
@@ -437,19 +506,28 @@ npm run dev
 - 创建后会显示完整 Key（仅显示一次，请复制保存）
 - 可以对 Key 进行刷新、吊销、删除操作
 
-### 12.4 实时监控
+### 13.4 实时监控
 
 - 点击侧边栏 "Monitor"
 - 查看当前并发数、SSE 连接数、请求速率、队列长度
 - 数据每 2 秒自动刷新
 
-### 12.5 统计报告
+### 13.5 统计报告
 
 - 点击侧边栏 "Stats"
 - 选择时间范围（24小时/7天/30天/自定义）
 - 查看汇总数据卡片
 - 切换 "By User" / "By API" 标签查看详细统计
 - 点击 "Export" 下拉菜单导出报告
+
+### 13.6 策略配置
+
+- 点击侧边栏 "Settings"
+- 上半部分显示静态配置（只读，需修改 config.yaml 并重启）
+- 下半部分显示策略配置（可编辑）
+- 点击任意策略值可以直接编辑
+- 点击 "Import" 上传 YAML 文件，预览差异后确认导入
+- 点击 "Export" 下载当前策略为 YAML 文件
 
 ---
 
@@ -468,6 +546,7 @@ npm run dev
 |------|------|------|
 | GET | /health | 健康检查 |
 | POST | /login | 管理员登录 |
+| GET | /config | 获取静态配置 |
 | GET | /api-keys | 列出 API Key |
 | POST | /api-keys | 创建 API Key |
 | GET | /api-keys/{id} | 获取单个 Key |
@@ -481,3 +560,9 @@ npm run dev
 | GET | /stats/users | 按用户统计 |
 | GET | /stats/apis | 按 API 统计 |
 | GET | /stats/export | 导出报告 |
+| GET | /policy | 获取所有策略 |
+| GET | /policy/{key} | 获取单个策略 |
+| PUT | /policy/{key} | 更新策略 |
+| POST | /policy/export | 导出策略为 YAML |
+| POST | /policy/import | 导入策略（预览差异） |
+| POST | /policy/import/confirm | 确认导入策略 |

@@ -38,7 +38,13 @@
   - [8.1 统计指标](#81-统计指标)
   - [8.2 数据保留](#82-数据保留)
   - [8.3 导出格式](#83-导出格式)
-- [9. 配置文件](#9-配置文件)
+- [9. 配置管理](#9-配置管理)
+  - [9.1 Config（静态配置）](#91-config静态配置)
+  - [9.2 Policy（动态策略）](#92-policy动态策略)
+  - [9.3 Policy 数据库表结构](#93-policy-数据库表结构)
+  - [9.4 Policy API](#94-policy-api)
+  - [9.5 Policy 初始化](#95-policy-初始化)
+  - [9.6 热更新机制](#96-热更新机制)
 - [10. 项目结构](#10-项目结构)
 - [11. 测试策略](#11-测试策略)
   - [11.1 单元测试](#111-单元测试)
@@ -590,39 +596,45 @@ bcrypt 验证 ---> 失败 ---> 401
 
 ---
 
-## 9. 配置文件
+## 9. 配置管理
 
-### 9.1 完整配置示例
+系统配置分为两部分：
+
+| 类型 | 存储位置 | 特点 |
+|------|----------|------|
+| **Config** | `config.yaml` 文件 | 静态配置，需重启生效，包含敏感信息 |
+| **Policy** | 数据库 | 动态策略，热更新生效，可导入导出 |
+
+### 9.1 Config（静态配置）
+
+存储于 `config.yaml`，包含启动必需的配置和敏感信息：
 
 ```yaml
 # config.yaml
 
 server:
+  host: "0.0.0.0"
   proxy_port: 8000
   admin_port: 8001
-  host: "0.0.0.0"
-
-downstream:
-  base_url: "https://api.example.com"
-  timeout: 30
 
 database:
-  # SQLite
-  type: "sqlite"
-  path: "./data/pylon.db"
-
-  # PostgreSQL (alternative)
-  # type: "postgresql"
-  # host: "localhost"
-  # port: 5432
-  # database: "pylon"
-  # username: "pylon"
-  # password: "secret"
+  url: "sqlite+aiosqlite:///./data/pylon.db"
 
 admin:
   password_hash: "$2b$12$xxxxx..."  # bcrypt 哈希，用 pylon hash-password 生成
   jwt_secret: "your-jwt-secret"     # JWT 签名密钥
-  jwt_expire_hours: 24              # JWT 有效期
+```
+
+### 9.2 Policy（动态策略）
+
+存储于数据库 `policy` 表，支持热更新和导入导出：
+
+```yaml
+# policy.yaml（导入导出格式）
+
+downstream:
+  base_url: "https://api.example.com"
+  timeout: 30
 
 rate_limit:
   global:
@@ -644,6 +656,14 @@ rate_limit:
       max_concurrent: 5
       max_requests_per_minute: 20
 
+  api_patterns:
+    - pattern: "GET /users/{id}"
+      rule:
+        max_requests_per_minute: 100
+    - pattern: "POST /v1/chat/*"
+      rule:
+        max_concurrent: 20
+
 queue:
   max_size: 100
   timeout: 30
@@ -654,11 +674,59 @@ sse:
 data_retention:
   days: 30
   cleanup_interval_hours: 24
-
-logging:
-  level: "INFO"
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 ```
+
+### 9.3 Policy 数据库表结构
+
+```
+policy 表
++---------+--------+----------------------------------+
+| 字段    | 类型   | 说明                             |
++---------+--------+----------------------------------+
+| key     | string | 主键，配置项名称                 |
+| value   | text   | JSON 格式的配置值                |
++---------+--------+----------------------------------+
+```
+
+示例数据：
+
+| key | value |
+|-----|-------|
+| `downstream.base_url` | `"https://api.example.com"` |
+| `downstream.timeout` | `30` |
+| `rate_limit.global` | `{"max_concurrent": 50, ...}` |
+| `rate_limit.default_user` | `{"max_concurrent": 4, ...}` |
+| `rate_limit.apis` | `{"POST /v1/chat/completions": {...}}` |
+| `rate_limit.api_patterns` | `[{"pattern": "...", "rule": {...}}]` |
+| `queue.max_size` | `100` |
+| `queue.timeout` | `30` |
+| `sse.idle_timeout` | `60` |
+| `data_retention.days` | `30` |
+| `data_retention.cleanup_interval_hours` | `24` |
+
+### 9.4 Policy API
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/policy` | GET | 获取全部策略配置 |
+| `/policy/{key}` | GET | 获取单个策略项 |
+| `/policy/{key}` | PUT | 更新单个策略项 |
+| `/policy/export` | POST | 导出为 YAML 文件 |
+| `/policy/import` | POST | 上传 YAML，返回 diff 预览 |
+| `/policy/import/confirm` | POST | 确认导入 |
+
+### 9.5 Policy 初始化
+
+服务启动时检测数据库：
+- 若 `policy` 表为空，使用内置默认值初始化
+- 若已有数据，直接加载使用
+
+### 9.6 热更新机制
+
+修改 Policy 后，系统自动通知相关服务重新加载配置：
+- `rate_limiter` - 限流规则变更
+- `proxy` - downstream 配置变更
+- `cleanup` - 数据保留策略变更
 
 ---
 

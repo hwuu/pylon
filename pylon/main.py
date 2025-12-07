@@ -10,12 +10,13 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
-from pylon.config import load_config, Config
+from pylon.config import load_config, Config, PolicyConfig, policy_from_dict
 from pylon.models import init_db, create_async_db_engine, create_async_session_factory
 from pylon.services.proxy import ProxyService
 from pylon.services.rate_limiter import RateLimiter
 from pylon.services.admin_auth import AdminAuthService
 from pylon.services.cleanup import CleanupService
+from pylon.services.policy import PolicyService, set_policy_service
 from pylon.api import proxy as proxy_api
 from pylon.api import admin as admin_api
 
@@ -23,7 +24,18 @@ from pylon.api import admin as admin_api
 logger = logging.getLogger(__name__)
 
 
-def create_proxy_app(config: Config, engine, session_factory, rate_limiter) -> FastAPI:
+# Global policy config that can be hot-reloaded
+_current_policy: PolicyConfig | None = None
+
+
+def get_current_policy() -> PolicyConfig:
+    """Get the current policy configuration."""
+    if _current_policy is None:
+        raise RuntimeError("Policy not initialized")
+    return _current_policy
+
+
+def create_proxy_app(config: Config, engine, session_factory, rate_limiter, policy_service: PolicyService) -> FastAPI:
     """Create the proxy FastAPI application."""
 
     @asynccontextmanager
@@ -31,12 +43,13 @@ def create_proxy_app(config: Config, engine, session_factory, rate_limiter) -> F
         # Startup
         logger.info("Starting Pylon proxy server...")
 
-        # Initialize services
-        proxy_service = ProxyService(config.downstream)
+        # Initialize services with current policy
+        policy = get_current_policy()
+        proxy_service = ProxyService(policy.downstream)
 
         # Set dependencies for routes
         proxy_api.set_dependencies(
-            proxy_service, rate_limiter, session_factory, config.sse.idle_timeout
+            proxy_service, rate_limiter, session_factory, policy.sse.idle_timeout
         )
 
         app.state.proxy_service = proxy_service
@@ -44,7 +57,7 @@ def create_proxy_app(config: Config, engine, session_factory, rate_limiter) -> F
         app.state.session_factory = session_factory
         app.state.engine = engine
 
-        logger.info(f"Proxy server ready, forwarding to {config.downstream.base_url}")
+        logger.info(f"Proxy server ready, forwarding to {policy.downstream.base_url}")
 
         yield
 
@@ -66,7 +79,7 @@ def create_proxy_app(config: Config, engine, session_factory, rate_limiter) -> F
     return app
 
 
-def create_admin_app(config: Config, session_factory, rate_limiter) -> FastAPI:
+def create_admin_app(config: Config, session_factory, rate_limiter, policy_service: PolicyService) -> FastAPI:
     """Create the admin FastAPI application."""
 
     @asynccontextmanager
@@ -76,8 +89,14 @@ def create_admin_app(config: Config, session_factory, rate_limiter) -> FastAPI:
         # Initialize admin auth service
         admin_auth_service = AdminAuthService(config.admin)
 
-        # Set dependencies for admin routes (including config for Settings page)
-        admin_api.set_dependencies(admin_auth_service, session_factory, rate_limiter, config)
+        # Set dependencies for admin routes
+        admin_api.set_dependencies(
+            admin_auth_service,
+            session_factory,
+            rate_limiter,
+            config,
+            policy_service,
+        )
 
         app.state.admin_auth_service = admin_auth_service
 
@@ -99,14 +118,29 @@ def create_admin_app(config: Config, session_factory, rate_limiter) -> FastAPI:
 
 async def run_servers(config: Config):
     """Run both proxy and admin servers."""
-    # Initialize shared resources first
+    global _current_policy
+
+    # Initialize database
     engine = create_async_db_engine(config.database)
     async with engine.begin() as conn:
         from pylon.models.database import Base
         await conn.run_sync(Base.metadata.create_all)
 
     session_factory = create_async_session_factory(engine)
-    rate_limiter = RateLimiter(config.rate_limit, config.queue)
+
+    # Initialize policy service and load/init policy
+    policy_service = PolicyService(session_factory)
+    set_policy_service(policy_service)
+
+    # Initialize defaults if empty, then load policy
+    await policy_service.init_defaults()
+    policy_dict = await policy_service.get_all()
+    _current_policy = policy_from_dict(policy_dict)
+
+    logger.info("Policy loaded from database")
+
+    # Create rate limiter with policy config
+    rate_limiter = RateLimiter(_current_policy.rate_limit, _current_policy.queue)
 
     # Create user config loader callback for rate limiter
     async def load_user_rate_limit_config(user_id: str):
@@ -125,13 +159,30 @@ async def run_servers(config: Config):
 
     rate_limiter.set_user_config_loader(load_user_rate_limit_config)
 
+    # Register policy update callback for hot reload
+    async def on_policy_update(key: str):
+        """Handle policy updates for hot reload."""
+        global _current_policy
+        logger.info(f"Policy updated: {key}")
+
+        # Reload full policy
+        policy_dict = await policy_service.get_all()
+        _current_policy = policy_from_dict(policy_dict)
+
+        # Notify services based on what changed
+        if key.startswith("rate_limit.") or key.startswith("queue."):
+            rate_limiter.reload_config(_current_policy.rate_limit, _current_policy.queue)
+            logger.info("Rate limiter config reloaded")
+
+    policy_service.on_update(on_policy_update)
+
     # Initialize cleanup service
-    cleanup_service = CleanupService(session_factory, config.data_retention)
+    cleanup_service = CleanupService(session_factory, _current_policy.data_retention)
     cleanup_service.start()
 
     # Create apps with shared resources
-    proxy_app = create_proxy_app(config, engine, session_factory, rate_limiter)
-    admin_app = create_admin_app(config, session_factory, rate_limiter)
+    proxy_app = create_proxy_app(config, engine, session_factory, rate_limiter, policy_service)
+    admin_app = create_admin_app(config, session_factory, rate_limiter, policy_service)
 
     proxy_config = uvicorn.Config(
         proxy_app,

@@ -700,3 +700,29 @@ class RateLimiter:
         stats["user_stats"] = user_stats
 
         return stats
+
+    def reload_config(
+        self,
+        rate_limit_config: RateLimitConfig,
+        queue_config: Optional[QueueConfig] = None,
+    ) -> None:
+        """
+        Reload configuration for hot update.
+
+        Note: This does not reset current counters, only updates the limits.
+        The queue is recreated if queue_config is provided.
+
+        Args:
+            rate_limit_config: New rate limit configuration
+            queue_config: New queue configuration (optional)
+        """
+        self.config = rate_limit_config
+
+        # Clear user config cache so it will be reloaded with new defaults
+        self._user_config_cache.clear()
+
+        # Recreate queue if config changed
+        if queue_config is not None:
+            self._queue = RequestQueue(queue_config, self._try_acquire_slot)
+
+        logger.info("Rate limiter configuration reloaded")
