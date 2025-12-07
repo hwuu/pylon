@@ -1,7 +1,10 @@
 import axios from 'axios'
 
+// Get API base URL from runtime config (set by Docker) or fallback to /api (dev mode with vite proxy)
+const apiBaseUrl = window.PYLON_CONFIG?.API_BASE_URL || '/api'
+
 const api = axios.create({
-  baseURL: '/api',
+  baseURL: apiBaseUrl,
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json'

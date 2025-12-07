@@ -1,0 +1,41 @@
+services:
+  # Pylon proxy and admin server
+  proxy:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: pylon
+    command: serve -c /config/config.yaml
+    ports:
+      - "8000:8000"  # Proxy port
+      - "8001:8001"  # Admin port
+    volumes:
+      - ../data:/data
+      - ./config.yaml:/config/config.yaml:ro
+    depends_on:
+      - mock
+    restart: unless-stopped
+
+  # Frontend (Nginx serving static files)
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: pylon
+    command: frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - API_BASE_URL=http://localhost:8001
+    restart: unless-stopped
+
+  # Mock server (for testing)
+  mock:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: pylon
+    command: mock
+    ports:
+      - "9999:9999"
+    restart: unless-stopped

@@ -15,13 +15,30 @@ Pylon 是一个 HTTP API 代理服务，提供 API Key 认证、多维度限流�
 
 ## 快速开始
 
-### 1. 安装依赖
+### Docker 部署（推荐）
+
+```bash
+cd docker
+docker compose up -d
+```
+
+- 前端界面：http://localhost:5173
+- 代理端口：http://localhost:8000
+- 管理端口：http://localhost:8001
+
+默认密码：`admin`
+
+详细说明参考 [Docker 部署指南](docker/README.md)。
+
+### 本地开发
+
+#### 1. 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 创建配置文件
+#### 2. 创建配置文件
 
 复制示例配置并修改：
 
@@ -37,7 +54,7 @@ python -m pylon hash-password
 
 将生成的哈希值填入 `config.yaml` 的 `admin.password_hash` 字段。
 
-### 3. 启动服务
+#### 3. 启动服务
 
 ```bash
 python -m pylon -c config.yaml
@@ -49,7 +66,7 @@ python -m pylon -c config.yaml
 
 首次启动时，策略配置（Policy）会自动初始化为默认值并存入数据库。
 
-### 4. 创建 API Key
+#### 4. 创建 API Key
 
 ```bash
 # 登录获取 Token
@@ -64,7 +81,7 @@ curl -X POST http://localhost:8001/api-keys \
   -d '{"description": "My App"}'
 ```
 
-### 5. 使用代理
+#### 5. 使用代理
 
 ```bash
 curl http://localhost:8000/your-api-endpoint \
@@ -85,6 +102,7 @@ npm run dev
 
 - [设计文档](docs/design.md) - 详细的架构设计、数据模型、限流策略等
 - [使用示例](docs/demo.md) - 完整的手动测试流程和使用指南
+- [Docker 部署](docker/README.md) - Docker 镜像构建和部署指南
 
 ## 项目结构
 
@@ -101,6 +119,10 @@ pylon/
 │       ├── views/         # 页面组件
 │       ├── router/        # 路由
 │       └── stores/        # 状态管理
+├── docker/                # Docker 相关文件
+│   ├── Dockerfile
+│   ├── docker-compose.yaml
+│   └── README.md
 ├── tests/                 # 测试
 │   ├── unit/              # 单元测试
 │   ├── e2e/               # 端到端测试
